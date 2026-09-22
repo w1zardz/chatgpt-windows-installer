@@ -1,6 +1,6 @@
 ﻿#Requires -Version 5.1
 Set-StrictMode -Version 2.0
-$script:ToolVersion = '1.0.1'
+$script:ToolVersion = '1.0.2'
 $script:PackageIdentity = 'OpenAI.Codex'
 $script:PackagePublisher = 'CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B'
 $script:FeedUri = 'https://persistent.oaistatic.com/codex-app-prod/windows-store-update.json'
@@ -451,6 +451,8 @@ function Start-ElevatedInstaller {
     if ($CallerSid -notmatch '^S-1-5-(\d+-)*\d+$') { throw 'CALLER_SID_INVALID' }
     $command = "& '$escapedPath' -Mode Auto -Language '$Language' -CallerSid '$CallerSid'"
     if ($NoPause) { $command += ' -NoPause' }
+    # -EncodedCommand otherwise collapses a script's nonzero exit code to 1.
+    $command += '; exit $LASTEXITCODE'
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
     $executable = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $process = Start-Process -FilePath $executable -Verb RunAs -WindowStyle Normal -Wait -PassThru -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded) -ErrorAction Stop

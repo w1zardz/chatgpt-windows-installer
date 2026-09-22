@@ -145,6 +145,21 @@ $null = New-Item -ItemType Directory -Path $tempRoot
 $oldLocal = $env:LOCALAPPDATA
 $oldProgramData = $env:ProgramData
 try {
+    # Execute the real encoded handoff command in a child Windows PowerShell,
+    # replacing only the UAC launch and the fixture's installation work.
+    $handoffFixture = Join-Path $tempRoot "handoff user's fixture.ps1"
+    & $module {
+        function script:Start-Process {
+            param($FilePath,$Verb,$WindowStyle,[switch]$Wait,[switch]$PassThru,$ArgumentList)
+            if ($Verb -ne 'RunAs') { throw 'Handoff must request UAC in production' }
+            Microsoft.PowerShell.Management\Start-Process -FilePath $FilePath -WindowStyle Hidden -Wait -PassThru -ArgumentList $ArgumentList
+        }
+    }
+    foreach ($code in @(0,1,2,10)) {
+        ('param($Mode,$Language,$CallerSid,[switch]$NoPause)' + [Environment]::NewLine + 'exit ' + $code) | Set-Content -LiteralPath $handoffFixture -Encoding UTF8
+        $handoffCode = & $module { param($Entry) Start-ElevatedInstaller -EntryPath $Entry -Language en -CallerSid 'S-1-5-21-1-1001' -NoPause } $handoffFixture
+        Assert-Equal $handoffCode $code ('Preserve exit code through encoded handoff: ' + $code)
+    }
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zipPath = Join-Path $tempRoot 'test.msix'

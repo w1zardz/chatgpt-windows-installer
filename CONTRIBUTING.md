@@ -17,6 +17,10 @@ Automated tests cover source/feed injection rejection, version/downgrade decisio
 
 Version 1.0.1 adds regression coverage for wrapped .NET HTTP exceptions, the documented fallback on 404, no fallback on 403, bounded timeout retries, fallback signature rejection, feed/package version differences, no downgrade to an older fallback package, and handing Windows the staged copy. Run both PowerShell engines after modifying these paths.
 
+Version 1.0.2 executes the real encoded handoff command in a child Windows PowerShell process and verifies exit codes 0, 1, 2 and 10, including an entry path containing spaces and an apostrophe. Only the UAC request is replaced for this test; the encoded command and child process are real. This prevents PowerShell from collapsing action-required/pending-registration results to generic exit code 1.
+
+A separate live same-user UAC fixture on the validation machine verified administrator elevation, forwarded arguments and return code 10 through the production handoff function. It performed no package installation.
+
 Initial real-machine validation checked read-only diagnostics on Windows x64, the current release feed, native package selection and the signature, identity and manifest of the official x64 package. Full installation on a clean machine, ARM64 deployment, UAC interaction under all account types, proxy-authenticated networks and enterprise restrictions require separate hands-on validation. Do not describe mocked tests as successful real installation.
 
 On 2026-09-22, a real Windows 11 x64 run of version 1.0.1 exercised same-user UAC, HTTP 404 fallback, the complete official download, signature and manifest checks, protected ProgramData staging and `Add-AppxPackage`. Windows accepted package `26.915.4065.0` for deferred registration while `26.903.8094.0` was running. The report correctly returned `PendingRegistration` with no error findings; it did not claim the advertised `26.917.6896.0` was installed. Activation after closing the app was still pending at release time.
