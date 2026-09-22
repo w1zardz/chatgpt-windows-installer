@@ -1,0 +1,34 @@
+name: Installation or update problem
+description: Report a reproducible ChatGPT Windows installation/update issue.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: "Do not post passwords, tokens, chats, usernames, corporate details or raw Windows event exports. Use the sanitized diagnostic report and review it first. Для описания можно использовать русский язык."
+  - type: input
+    id: version
+    attributes:
+      label: Tool version
+      placeholder: "1.0.0"
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Windows build and architecture
+      placeholder: "Windows 11 build 26100, x64"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: What happened and what did you expect?
+      description: Include whether this is a fresh install or an update, and the error code.
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Reviewed diagnostic findings
+      description: Paste only relevant non-private findings, not raw event logs.
+      render: text

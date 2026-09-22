@@ -1,0 +1,16 @@
+*.msix
+*.msixbundle
+*.appx
+*.appxbundle
+*.zip
+*.log
+*.clixml
+*.env
+.env*
+reports/
+cache/
+dist/
+work/
+TestResults*
+.DS_Store
+Thumbs.db
