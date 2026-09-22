@@ -82,13 +82,17 @@ A manual installation does **not** inherently turn off the app's built-in update
 
 Reports are stored in `%LOCALAPPDATA%\ChatGPTWindowsInstaller\reports`. Verified downloads from `-Mode Download` remain in the tool's own `cache` folder. Automatic mode deletes only its own downloaded file after use.
 
+For installation, the verified package is copied into a new protected directory under `%ProgramData%`, where Windows' deployment service can access it. Only administrators and SYSTEM receive write access; the current user receives read access. The exact copy is verified again before installation, then only that temporary file and its directory are removed. Existing folder permissions and application data are not changed.
+
 No report is uploaded. Reports include Windows/app versions, Windows home region, selected service/policy states and relevant error codes. They exclude raw event messages, usernames, computer names, SIDs, account credentials, proxy URLs and chats. Review any report before sharing it. See [security and privacy](SECURITY.md).
 
 Exit codes: **0** completed/current; **1** failed; **2** user/administrator action required; **10** Windows accepted the update, registration still needs verification after closing the app.
 
 ## Trust, sources and maintenance
 
-The code uses the production release feed embedded in the official app, then constructs a version-specific URL on the same OpenAI host. These distribution details can change. A changed feed schema, identity or signing publisher stops the tool; it never falls back to a third-party package mirror.
+The code checks the production release feed and tries its version-specific package. If that URL returns HTTP 404, it uses OpenAI's documented x64/ARM64 download link. Both paths require a valid Windows signature, the expected publisher, identity, architecture and compatible Windows version. No third-party package mirror is used.
+
+The feed and download can be published at different times. When they disagree, the tool reports both versions and uses the actual signed package version for installation and final verification. It can install an available intermediate update, but never downgrades a newer installed version or claims that the advertised release was installed when it was not. Reports record the failure phase, advertised version, verified package version, source type and registered version after the run.
 
 - [Official Windows deployment and MSIX downloads](https://learn.chatgpt.com/docs/enterprise/windows-deployment)
 - [Microsoft's AppX deployment errors](https://learn.microsoft.com/en-us/windows/win32/appxpkg/troubleshooting)

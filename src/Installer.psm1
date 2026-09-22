@@ -1,6 +1,6 @@
 ﻿#Requires -Version 5.1
 Set-StrictMode -Version 2.0
-$script:ToolVersion = '1.0.0'
+$script:ToolVersion = '1.0.1'
 $script:PackageIdentity = 'OpenAI.Codex'
 $script:PackagePublisher = 'CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B'
 $script:FeedUri = 'https://persistent.oaistatic.com/codex-app-prod/windows-store-update.json'
@@ -107,6 +107,17 @@ function Get-ExceptionCode {
     return 'UNCLASSIFIED'
 }
 
+function Get-NetworkException {
+    param($ErrorRecord)
+    # .NET calls in Windows PowerShell wrap WebException in MethodInvocationException.
+    $exception = $ErrorRecord.Exception
+    for ($depth = 0; $exception -and $depth -lt 8; $depth++) {
+        if ($exception -is [Net.WebException]) { return $exception }
+        $exception = $exception.InnerException
+    }
+    return $null
+}
+
 function ConvertTo-Release {
     param($Feed, [ValidateSet('x64', 'arm64')][string]$Architecture)
     if (-not $Feed -or -not ($Feed.PSObject.Properties.Name -contains 'schemaVersion') -or $Feed.schemaVersion -ne 1) { throw 'FEED_FORMAT_CHANGED' }
@@ -129,7 +140,7 @@ function Assert-OfficialUri {
     $parsed = $null
     if (-not [uri]::TryCreate($Uri, [UriKind]::Absolute, [ref]$parsed)) { throw 'UNTRUSTED_URL' }
     if ($parsed.Scheme -cne 'https' -or $parsed.Host -cne 'persistent.oaistatic.com' -or -not $parsed.IsDefaultPort -or $parsed.UserInfo -or $parsed.Query -or $parsed.Fragment) { throw 'UNTRUSTED_URL' }
-    $validPath = $parsed.AbsolutePath -ceq '/codex-app-prod/windows-store-update.json' -or $parsed.AbsolutePath -cmatch '^/codex-app-prod/releases/\d+\.\d+\.\d+\.\d+/ChatGPT-(x64|arm64)\.msix$'
+    $validPath = $parsed.AbsolutePath -ceq '/codex-app-prod/windows-store-update.json' -or $parsed.AbsolutePath -cmatch '^/codex-app-prod/releases/\d+\.\d+\.\d+\.\d+/ChatGPT-(x64|arm64)\.msix$' -or $parsed.AbsolutePath -cmatch '^/codex-app-prod/ChatGPT-(x64|arm64)\.msix$'
     if (-not $validPath) { throw 'UNTRUSTED_URL' }
 }
 
@@ -294,6 +305,26 @@ function Save-OfficialPackage {
     } finally { $response.Close() }
 }
 
+function Save-ReleasePackage {
+    param($Release, [string]$Destination)
+    try {
+        Save-OfficialPackage $Release $Destination
+        return [pscustomobject]@{ Release = $Release; UsedFallback = $false }
+    } catch {
+        $network = Get-NetworkException $_
+        if (-not $network -or -not $network.Response -or [int]$network.Response.StatusCode -ne 404) { throw }
+        $network.Response.Close()
+    }
+    Write-Step 'The versioned package is not published. Trying OpenAI''s documented download link...' 'Пакет по ссылке с номером версии не опубликован. Проверяю официальную ссылку OpenAI для скачивания...' Yellow
+    if ($Release.Architecture -notin @('x64', 'arm64')) { throw 'UNTRUSTED_URL' }
+    $fallback = [pscustomobject]@{
+        Version = $Release.Version; Architecture = $Release.Architecture
+        Uri = 'https://persistent.oaistatic.com/codex-app-prod/ChatGPT-' + $Release.Architecture + '.msix'
+    }
+    Save-OfficialPackage $fallback $Destination
+    return [pscustomobject]@{ Release = $fallback; UsedFallback = $true }
+}
+
 function Get-MsixMetadata {
     param([string]$Path)
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -323,19 +354,22 @@ function Get-MsixMetadata {
 }
 
 function Assert-PackageMetadata {
-    param($Metadata, $Release, [string]$WindowsVersion)
+    param($Metadata, $Release, [string]$WindowsVersion, [switch]$AllowVersionDifference)
     if ($Metadata.Name -cne $script:PackageIdentity -or $Metadata.Publisher -cne $script:PackagePublisher) { throw 'PACKAGE_IDENTITY_MISMATCH' }
     if ($Metadata.Architecture -cne $Release.Architecture) { throw '0x80073D10' }
-    if ([version]$Metadata.Version -ne [version]$Release.Version) { throw 'PACKAGE_VERSION_MISMATCH' }
+    if ([string]$Metadata.Version -cnotmatch '^\d{1,5}\.\d{1,5}\.\d{1,5}\.\d{1,5}$') { throw 'PACKAGE_VERSION_MISMATCH' }
+    $packageVersion = [version]$Metadata.Version
+    foreach ($part in @($packageVersion.Major, $packageVersion.Minor, $packageVersion.Build, $packageVersion.Revision)) { if ($part -gt 65535) { throw 'PACKAGE_VERSION_MISMATCH' } }
+    if (-not $AllowVersionDifference -and $packageVersion -ne [version]$Release.Version) { throw 'PACKAGE_VERSION_MISMATCH' }
     if ([version]$Metadata.MinWindowsVersion -gt [version]$WindowsVersion) { throw '0x80073CFD' }
 }
 
 function Confirm-OfficialPackage {
-    param([string]$Path, $Release, [string]$WindowsVersion)
+    param([string]$Path, $Release, [string]$WindowsVersion, [switch]$AllowVersionDifference)
     $signature = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
     if ($signature.Status -ne [Management.Automation.SignatureStatus]::Valid -or -not $signature.SignerCertificate -or $signature.SignerCertificate.Subject -cne $script:PackagePublisher) { throw 'PACKAGE_SIGNATURE_INVALID' }
     $metadata = Get-MsixMetadata $Path
-    Assert-PackageMetadata $metadata $Release $WindowsVersion
+    Assert-PackageMetadata $metadata $Release $WindowsVersion -AllowVersionDifference:$AllowVersionDifference
     return [pscustomobject]@{ Metadata = $metadata; Sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash; SignatureStatus = 'Valid' }
 }
 
@@ -361,12 +395,53 @@ function Get-InstallOutcome {
     return 'PendingRegistration'
 }
 
+function New-ProtectedStagingDirectory {
+    # AppX's service may not be able to open a package in a user's profile.
+    # Create a new directory atomically with explicit, non-inherited permissions.
+    $directory = New-Object IO.DirectoryInfo (Join-Path $env:ProgramData ('ChatGPTWindowsInstaller-' + [guid]::NewGuid().ToString('N')))
+    if ($directory.Exists) { throw 'STAGING_DIRECTORY_EXISTS' }
+    $security = New-Object Security.AccessControl.DirectorySecurity
+    $security.SetAccessRuleProtection($true, $false)
+    $administrators = New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544'
+    $system = New-Object Security.Principal.SecurityIdentifier 'S-1-5-18'
+    $user = New-Object Security.Principal.SecurityIdentifier (Get-CurrentUserSid)
+    $security.SetOwner($administrators)
+    $inherit = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    foreach ($identity in @($administrators, $system)) {
+        $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($identity, [Security.AccessControl.FileSystemRights]::FullControl, $inherit, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
+    }
+    $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($user, [Security.AccessControl.FileSystemRights]::ReadAndExecute, $inherit, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        [IO.FileSystemAclExtensions]::Create($directory, $security)
+    } else {
+        $directory.Create($security)
+    }
+    return $directory.FullName
+}
+
 function Install-VerifiedPackage {
     param([string]$Path, $Release, [string]$WindowsVersion)
-    # Recheck trust at the installation boundary, even if the caller checked earlier.
     $null = Confirm-OfficialPackage $Path $Release $WindowsVersion
-    Add-AppxPackage -Path $Path -DeferRegistrationWhenPackagesAreInUse -ErrorAction Stop
-    return Get-InstallOutcome (Get-InstalledPackage) $Release.Version
+    $stageDirectory = $null
+    $stagePath = $null
+    try {
+        $stageDirectory = New-ProtectedStagingDirectory
+        $stagePath = Join-Path $stageDirectory ('ChatGPT-' + $Release.Architecture + '.msix')
+        Copy-Item -LiteralPath $Path -Destination $stagePath -ErrorAction Stop
+        # Verify the exact protected copy that Windows will open.
+        $null = Confirm-OfficialPackage $stagePath $Release $WindowsVersion
+        Add-AppxPackage -Path $stagePath -DeferRegistrationWhenPackagesAreInUse -ErrorAction Stop
+        return Get-InstallOutcome (Get-InstalledPackage) $Release.Version
+    } finally {
+        if ($stageDirectory) {
+            $resolved = [IO.Path]::GetFullPath($stageDirectory)
+            $parent = [IO.Path]::GetFullPath($env:ProgramData).TrimEnd([char[]]'\/')
+            if ((Split-Path $resolved -Parent) -eq $parent -and (Split-Path $resolved -Leaf) -match '^ChatGPTWindowsInstaller-[a-f0-9]{32}$') {
+                if ($stagePath -and (Test-Path -LiteralPath $stagePath)) { Remove-Item -LiteralPath $stagePath -Force -ErrorAction SilentlyContinue }
+                Remove-Item -LiteralPath $resolved -ErrorAction SilentlyContinue
+            }
+        }
+    }
 }
 
 function Start-ElevatedInstaller {
@@ -400,6 +475,8 @@ function Write-Report {
         if ($Report.system.PSObject.Properties.Name -contains 'installedVersion') { $lines += 'Installed / Установлено: ' + $Report.system.installedVersion }
     }
     $lines += 'Available / Доступно: ' + $Report.latestVersion
+    $lines += 'Verified package / Проверенный пакет: ' + $Report.packageVersion
+    $lines += 'Registered after run / Зарегистрировано после запуска: ' + $Report.installedVersionAfter
     $lines += ''
     foreach ($finding in $Report.findings) {
         $lines += '[' + $finding.severity + ' / ' + $finding.code + '] ' + $finding.summary
@@ -435,7 +512,8 @@ function Invoke-ChatGPTInstaller {
     $report = [ordered]@{
         toolVersion = $script:ToolVersion; generatedUtc = [DateTime]::UtcNow.ToString('o'); mode = $Mode
         outcome = 'Checking'; system = $null; latestVersion = $null; findings = @(); recentDeploymentErrors = @()
-        packageSha256 = $null; signatureStatus = $null
+        packageSha256 = $null; signatureStatus = $null; packageVersion = $null
+        packageSource = $null; installedVersionAfter = $null; phase = 'Preflight'
     }
     $dataRoot = Join-Path $env:LOCALAPPDATA 'ChatGPTWindowsInstaller'
     $runDirectory = $null
@@ -461,6 +539,7 @@ function Invoke-ChatGPTInstaller {
         }
         $release = $null
         if (-not $Offline -and $snapshot.architecture -in @('x64', 'arm64')) {
+            $report.phase = 'ReleaseCheck'
             Write-Step 'Checking the official release feed...' 'Проверяю официальный канал обновлений...'
             $release = Get-LatestRelease $snapshot.architecture
             $report.latestVersion = $release.Version
@@ -496,17 +575,27 @@ function Invoke-ChatGPTInstaller {
         $runDirectory = Join-Path $dataRoot ('cache\' + [guid]::NewGuid().ToString('N'))
         $null = New-Item -ItemType Directory -Force -Path $runDirectory
         $packagePath = Join-Path $runDirectory ('ChatGPT-' + $release.Architecture + '.msix')
+        $report.phase = 'Download'
         Write-Step ('Downloading version ' + $release.Version + ' from OpenAI...') ('Загружаю версию ' + $release.Version + ' с сервера OpenAI...')
         # One retry for a transient transport failure; never retry signature or policy failures.
         for ($attempt = 1; $attempt -le 2; $attempt++) {
-            try { Save-OfficialPackage $release $packagePath; break }
-            catch [Net.WebException] {
-                if ($attempt -eq 2 -or $_.Exception.Status -notin @([Net.WebExceptionStatus]::Timeout, [Net.WebExceptionStatus]::ConnectionClosed, [Net.WebExceptionStatus]::ReceiveFailure, [Net.WebExceptionStatus]::ConnectFailure)) { throw }
+            try { $download = Save-ReleasePackage $release $packagePath; break }
+            catch {
+                $network = Get-NetworkException $_
+                if ($attempt -eq 2 -or -not $network -or $network.Status -notin @([Net.WebExceptionStatus]::Timeout, [Net.WebExceptionStatus]::ConnectionClosed, [Net.WebExceptionStatus]::ReceiveFailure, [Net.WebExceptionStatus]::ConnectFailure)) { throw }
                 Write-Step 'The download was interrupted; retrying once...' 'Загрузка прервалась; повторяю один раз...' Yellow
             }
         }
         Write-Step 'Verifying the Windows signature, package identity, version and compatibility...' 'Проверяю подпись Windows, издателя, версию и совместимость пакета...'
-        $verified = Confirm-OfficialPackage $packagePath $release $snapshot.windowsVersion
+        $report.phase = 'Verification'
+        $verified = Confirm-OfficialPackage $packagePath $download.Release $snapshot.windowsVersion -AllowVersionDifference:$download.UsedFallback
+        $report.packageVersion = $verified.Metadata.Version
+        $report.packageSource = if ($download.UsedFallback) { 'DocumentedLatest' } else { 'Versioned' }
+        if ($report.packageVersion -ne $report.latestVersion) {
+            $report.findings += New-Finding 'RELEASE_CHANNEL_DIFFERENCE' 'warning' (Get-Text ('The feed advertises ' + $report.latestVersion + '; the signed download contains ' + $report.packageVersion + '.') ('Канал обновлений сообщает ' + $report.latestVersion + ', а подписанный пакет содержит ' + $report.packageVersion + '.')) (Get-Text 'Only the verified package version can be installed. A newer installed version will be kept. Run this tool again later to check for the advertised release.' 'Установить можно только проверенную версию пакета. Более новая установленная версия будет сохранена. Проверьте наличие объявленного релиза позже.')
+        }
+        # Bind installation and the final comparison to the actual signed package.
+        $release = [pscustomobject]@{Version=$report.packageVersion;Architecture=$download.Release.Architecture;Uri=$download.Release.Uri}
         $report.packageSha256 = $verified.Sha256
         $report.signatureStatus = $verified.SignatureStatus
         $report.findings += @(Get-DependencyFindings $verified.Metadata)
@@ -521,7 +610,9 @@ function Invoke-ChatGPTInstaller {
         if ($decision -in @('Current', 'NewerInstalled')) { $report.outcome = $decision; return 0 }
         if ($decision -eq 'NeedsRepair') { throw 'PACKAGE_STATUS_CHANGED' }
         Write-Step 'Installing the verified package. Running applications will not be force-closed.' 'Устанавливаю проверенный пакет. Запущенные приложения не закрываются принудительно.'
+        $report.phase = 'Deployment'
         $report.outcome = Install-VerifiedPackage $packagePath $release $snapshot.windowsVersion
+        $report.phase = 'RegistrationCheck'
         if ($report.outcome -eq 'PendingRegistration') {
             Write-Step 'Windows accepted the update. Close ChatGPT completely and reopen it, then run this tool again to verify the installed version.' 'Windows приняла обновление. Полностью закройте ChatGPT и откройте снова, затем запустите скрипт ещё раз для проверки установленной версии.' Yellow
             return 10
@@ -532,23 +623,26 @@ function Invoke-ChatGPTInstaller {
     catch {
         $report.outcome = 'Failed'
         $code = Get-ExceptionCode $_
+        $network = Get-NetworkException $_
         $safeCustom = @('FEED_FORMAT_CHANGED', 'FEED_IDENTITY_MISMATCH', 'FEED_VERSION_INVALID', 'FEED_TOO_LARGE', 'UNTRUSTED_URL', 'UNEXPECTED_HTTP_STATUS', 'RELEASE_UNAVAILABLE', 'PACKAGE_SIGNATURE_INVALID', 'PACKAGE_IDENTITY_MISMATCH', 'PACKAGE_VERSION_MISMATCH', 'PACKAGE_SIZE_INVALID', 'MANIFEST_INVALID', 'DOWNLOAD_INCOMPLETE', 'DOWNLOAD_LIMIT_EXCEEDED', 'ANOTHER_INSTANCE', 'PACKAGE_STATUS_CHANGED')
         if ($_.Exception.Message -in $safeCustom) {
             $code = $_.Exception.Message
             $report.findings += New-Finding $code 'error' (Get-Text 'A required integrity or workflow check did not pass.' 'Не пройдена обязательная проверка целостности или выполнения.') (Get-Text 'Use the latest release of this tool and check the official installer. For ANOTHER_INSTANCE, let the other copy finish. Signature checks and source checks are never bypassed.' 'Используйте свежую версию скрипта и проверьте официальный установщик. При ANOTHER_INSTANCE дождитесь другой копии. Проверки подписи и источника не обходятся.')
-        } elseif ($_.Exception -is [Net.WebException]) {
-            $networkCode = switch ($_.Exception.Status) {
+        } elseif ($network) {
+            $networkCode = switch ($network.Status) {
                 'NameResolutionFailure' { '0x80072EE7' }
                 'Timeout' { '0x80072EE2' }
                 'TrustFailure' { '0x80072F8F' }
                 'SecureChannelFailure' { '0x80072F8F' }
                 default { '0x80072EFD' }
             }
-            $code = $networkCode
-            $report.findings += Get-ErrorAdvice $code
-            if ($_.Exception.Response) {
-                $status = [int]$_.Exception.Response.StatusCode
-                $report.findings += New-Finding ('HTTP_' + $status) 'error' (Get-Text ('The official server returned HTTP ' + $status + '.') ('Официальный сервер ответил HTTP ' + $status + '.')) (Get-Text 'This response alone cannot identify a country restriction. Check network/proxy policy and try again later; 404 may mean the release source changed.' 'Этот ответ сам по себе не доказывает региональное ограничение. Проверьте сеть и прокси, повторите позже; 404 может означать изменение источника релиза.')
+            if ($network.Response) {
+                $status = [int]$network.Response.StatusCode
+                $code = 'HTTP_' + $status
+                $report.findings += New-Finding $code 'error' (Get-Text ('The official server returned HTTP ' + $status + '.') ('Официальный сервер ответил HTTP ' + $status + '.')) (Get-Text 'This response alone cannot identify a country restriction. Check network/proxy policy and try again later; 404 means this package URL is unavailable.' 'Этот ответ сам по себе не доказывает региональное ограничение. Проверьте сеть и прокси, повторите позже; 404 означает, что пакет по этой ссылке недоступен.')
+            } else {
+                $code = $networkCode
+                $report.findings += Get-ErrorAdvice $code
             }
         } else { $report.findings += Get-ErrorAdvice $code }
         Write-Step ('Stopped: ' + $code + '. See the diagnostic report below.') ('Остановлено: ' + $code + '. Подробности в отчёте ниже.') Red
@@ -558,6 +652,7 @@ function Invoke-ChatGPTInstaller {
         if ($locked) { $mutex.ReleaseMutex() }
         $mutex.Dispose()
         if ($reportNeeded) {
+            try { $finalPackage = Get-InstalledPackage; if ($finalPackage) { $report.installedVersionAfter = [string]$finalPackage.Version } } catch { }
             foreach ($finding in $report.findings | Where-Object severity -in @('blocker', 'error', 'warning')) {
                 Write-Host ('[' + $finding.code + '] ' + $finding.summary) -ForegroundColor Yellow
                 Write-Host $finding.action

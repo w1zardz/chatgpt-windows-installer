@@ -15,7 +15,11 @@ No package manager or Pester installation is required. Windows PowerShell 5.1 is
 
 Automated tests cover source/feed injection rejection, version/downgrade decisions, incompatible manifests, unsigned package rejection, offline diagnosis, same-user elevation, required dependencies, in-use/deferred registration, failed downloads, policy refusals and report privacy. Deployment calls are mocked: the tests do not install/uninstall applications or change Windows settings.
 
+Version 1.0.1 adds regression coverage for wrapped .NET HTTP exceptions, the documented fallback on 404, no fallback on 403, bounded timeout retries, fallback signature rejection, feed/package version differences, no downgrade to an older fallback package, and handing Windows the staged copy. Run both PowerShell engines after modifying these paths.
+
 Initial real-machine validation checked read-only diagnostics on Windows x64, the current release feed, native package selection and the signature, identity and manifest of the official x64 package. Full installation on a clean machine, ARM64 deployment, UAC interaction under all account types, proxy-authenticated networks and enterprise restrictions require separate hands-on validation. Do not describe mocked tests as successful real installation.
+
+On 2026-09-22, a real Windows 11 x64 run of version 1.0.1 exercised same-user UAC, HTTP 404 fallback, the complete official download, signature and manifest checks, protected ProgramData staging and `Add-AppxPackage`. Windows accepted package `26.915.4065.0` for deferred registration while `26.903.8094.0` was running. The report correctly returned `PendingRegistration` with no error findings; it did not claim the advertised `26.917.6896.0` was installed. Activation after closing the app was still pending at release time.
 
 Before an installation-related release, use disposable Windows test machines with snapshots. Verify fresh install, existing app update, app-in-use behavior, standard-account handling and missing dependencies; check user data and final registered version. Report exactly which cases were exercised.
 

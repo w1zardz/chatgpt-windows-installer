@@ -27,6 +27,12 @@ Trust also requires `Get-AuthenticodeSignature` to return `Valid`, which delegat
 
 No downloaded code is evaluated as PowerShell. Feed values are not interpolated into commands. Package downloads reject redirects, arbitrary hosts, credentials in URLs, query strings and unexpected paths. No TLS or package-signature bypass is implemented.
 
-The release feed is used to compare versions before downloading hundreds of megabytes. The version-specific URL keeps the downloaded package tied to that decision. The signed package version must match the feed, and newer installed versions are never downgraded.
+The release feed is used to compare versions before downloading hundreds of megabytes. A version-specific download must match the advertised version exactly. If that URL returns HTTP 404, the tool tries the documented architecture-specific latest URL, still restricted to the same OpenAI HTTPS host. Authentication, TLS and signature failures never trigger a source fallback.
+
+The documented download may lag behind or be ahead of the feed. After Windows validates the signature, the tool validates the manifest identity, publisher, architecture, numeric version and OS compatibility, then binds deployment to that actual package version. Both advertised and verified versions are reported with a warning if they differ. The installation boundary verifies the signature again and requires this exact package version. Newer installed versions are never downgraded.
+
+On 2026-09-22, the feed advertised `26.917.6896.0` while its version-specific x64 URL returned HTTP 404. Version 1.0.0 stopped with a generic .NET wrapper error. Version 1.0.1 adds the documented fallback and recognizes nested network exceptions so reports retain HTTP status and transient failures can be retried.
 
 The main installation command is current-user `Add-AppxPackage` with deferred registration. It intentionally does not perform all-user provisioning or install an offline license; follow the official deployment guide when that scope is required.
+
+The package handed to AppX is a verified copy in a newly created protected `%ProgramData%` directory. On the validation machine, deployment from the user-profile cache failed with `0x80073CF0` / `0x80070003`, while the identical signed package in ProgramData was accepted for deferred registration. This is an observed path-dependent failure, not proof of a particular underlying Windows defect. The tool does not modify permissions on existing directories.

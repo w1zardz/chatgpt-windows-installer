@@ -7,6 +7,7 @@ This is a community installer wrapper, not an OpenAI or Microsoft product. Inspe
 - Production OpenAI host and expected paths only; no third-party package mirrors.
 - Windows signature/chain validation plus a pinned publisher subject and manifest identity.
 - Fresh verification immediately before the package-installation call.
+- Installation uses a reverified copy in an atomically created ProgramData directory with protected permissions. Administrators and SYSTEM can write; the current user can read. Existing directory permissions are not changed.
 - No `Invoke-Expression`, downloaded script execution, signature bypass, downgrade flag, process killing, app-data reset, registry repair or blanket AppX re-registration.
 - No antivirus, SmartScreen, firewall, execution-policy persistence, country, proxy or corporate-policy changes.
 - Administrator consent through Windows UAC; no stored passwords or elevation bypass.

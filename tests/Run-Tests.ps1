@@ -47,6 +47,8 @@ Assert-Throws { ConvertTo-Release $copy 'x64' } 'FEED_FORMAT_CHANGED' 'Reject ne
 Assert-Throws { ConvertTo-Release ([pscustomobject]@{schemaVersion=1}) 'x64' } 'FEED_FORMAT_CHANGED' 'Missing feed properties'
 
 Assert-OfficialUri $release.Uri
+Assert-OfficialUri 'https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix'
+Assert-OfficialUri 'https://persistent.oaistatic.com/codex-app-prod/ChatGPT-arm64.msix'
 foreach ($url in @(
     'http://persistent.oaistatic.com/codex-app-prod/windows-store-update.json',
     'https://persistent.oaistatic.com.evil.example/codex-app-prod/windows-store-update.json',
@@ -56,6 +58,8 @@ foreach ($url in @(
     'https://persistent.oaistatic.com/codex-app-prod/windows-store-update.json?url=evil',
     'https://persistent.oaistatic.com/codex-app-prod/windows-store-update.json#fragment',
     'https://persistent.oaistatic.com/other/program.exe',
+    'https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x86.msix',
+    'https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix?redirect=evil',
     'file:///C:/fake.msix'
 )) { Assert-Throws { Assert-OfficialUri $url } 'UNTRUSTED_URL' ('Reject source: ' + $url) }
 
@@ -76,6 +80,12 @@ Assert-Equal (Get-InstallOutcome $installed $release.Version) 'Installed' 'Verif
 
 $metadata = [pscustomobject]@{ Name = 'OpenAI.Codex'; Publisher = 'CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B'; Version = $release.Version; Architecture = 'x64'; MinWindowsVersion = '10.0.19041.0'; Dependencies = @() }
 Assert-PackageMetadata $metadata $release '10.0.26100.0'
+$olderMetadata = $metadata | ConvertTo-Json | ConvertFrom-Json
+$olderMetadata.Version = '26.910.1.0'
+Assert-PackageMetadata $olderMetadata $release '10.0.26100.0' -AllowVersionDifference
+Assert-Throws { Assert-PackageMetadata $olderMetadata $release '10.0.26100.0' } 'PACKAGE_VERSION_MISMATCH' 'Versioned download remains strictly pinned'
+$olderMetadata.Publisher = 'CN=Other'
+Assert-Throws { Assert-PackageMetadata $olderMetadata $release '10.0.26100.0' -AllowVersionDifference } 'PACKAGE_IDENTITY_MISMATCH' 'Fallback never relaxes publisher validation'
 foreach ($change in @(@('Name','Malicious.App','PACKAGE_IDENTITY_MISMATCH'), @('Publisher','CN=Other','PACKAGE_IDENTITY_MISMATCH'), @('Architecture','arm64','0x80073D10'), @('Version','1.0.0.0','PACKAGE_VERSION_MISMATCH'), @('MinWindowsVersion','10.0.99999.0','0x80073CFD'))) {
     $copy = $metadata | ConvertTo-Json | ConvertFrom-Json; $copy.($change[0]) = $change[1]
     Assert-Throws { Assert-PackageMetadata $copy $release '10.0.26100.0' } $change[2] ('Reject package ' + $change[0])
@@ -84,6 +94,28 @@ foreach ($change in @(@('Name','Malicious.App','PACKAGE_IDENTITY_MISMATCH'), @('
 Assert-Equal ((Get-ErrorCodes 'Wrapper 0x80073cf6, cause 0x80073d28 and duplicate 0X80073D28') -join ',') '0x80073CF6,0x80073D28' 'Extract and normalize error codes'
 try { throw 'Wrapper 0x80073CF6 caused by 0x80073D28' } catch { Assert-Equal (Get-ExceptionCode $_) '0x80073D28' 'Prefer actionable nested error' }
 try { throw (New-Object ComponentModel.Win32Exception(1223)) } catch { Assert-Equal (Get-ExceptionCode $_) '0x800704C7' 'Recognize cancelled UAC prompt' }
+# Reproduce .NET's wrapped WebException without network requests.
+Add-Type -TypeDefinition @'
+using System;
+using System.Net;
+public sealed class InstallerTestResponse : WebResponse {
+    public HttpStatusCode StatusCode { get; private set; }
+    public InstallerTestResponse(int status) { StatusCode = (HttpStatusCode)status; }
+}
+public static class InstallerTestNetwork {
+    public static void Fail(int status) {
+        throw new WebException("Private https://user:secret@proxy.invalid/", null,
+            WebExceptionStatus.ProtocolError, new InstallerTestResponse(status));
+    }
+    public static void Timeout() {
+        throw new WebException("Private proxy secret", WebExceptionStatus.Timeout);
+    }
+}
+'@
+try { [InstallerTestNetwork]::Fail(404) } catch {
+    $network = & $module { param($Record) Get-NetworkException $Record } $_
+    Assert-Equal ([int]$network.Response.StatusCode) 404 'Find HTTP 404 inside method invocation wrapper'
+}
 $catalog = Get-Content -LiteralPath (Join-Path $root 'src\errors.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 Assert-Equal @($catalog.code | Select-Object -Unique).Count $catalog.Count 'Unique error mappings'
 foreach ($entry in $catalog) {
@@ -111,6 +143,7 @@ Assert-Equal @(Get-PreflightFindings $snapshot | Where-Object severity -eq 'bloc
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('chatgpt-installer-tests-' + [guid]::NewGuid().ToString('N'))
 $null = New-Item -ItemType Directory -Path $tempRoot
 $oldLocal = $env:LOCALAPPDATA
+$oldProgramData = $env:ProgramData
 try {
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -125,7 +158,8 @@ try {
 
     # Full workflow simulations. All package mutations and elevation are mocked.
     $env:LOCALAPPDATA = $tempRoot
-    foreach ($scenario in @('Current','Update','Pending','SignatureFailure','DownloadFailure','ChangedAccount','Offline','MissingDependency','Elevation','PolicyFailure','UnknownFailure')) {
+    $env:ProgramData = $tempRoot
+    foreach ($scenario in @('Current','Update','Pending','SignatureFailure','DownloadFailure','ChangedAccount','Offline','MissingDependency','Elevation','PolicyFailure','UnknownFailure','FallbackOlder','FallbackNoDowngrade','FallbackSignatureFailure','Http404','Http403','WrappedTimeout','TransientTimeout')) {
         Remove-Module Installer -Force
         $module = Import-Module $modulePath -Force -DisableNameChecking -PassThru
         & $module {
@@ -139,25 +173,39 @@ try {
                 [pscustomobject]@{windowsVersion='10.0.26100.0';architecture='x64';availableDiskBytes=@(10GB);pendingReboot=$false;services=@();configuredPolicies=@();legacyAppDetected=$false}
             }
             function script:Get-RecentDeploymentErrors { @() }
+            function script:New-ProtectedStagingDirectory {
+                $directory = Join-Path $env:ProgramData ('ChatGPTWindowsInstaller-' + [guid]::NewGuid().ToString('N'))
+                $null = New-Item -ItemType Directory -Path $directory
+                return $directory
+            }
             function script:Get-LatestRelease {
                 param($Architecture)
                 $script:FeedCalls++
                 [pscustomobject]@{Version='26.915.4065.0';Architecture='x64';Uri='https://persistent.oaistatic.com/codex-app-prod/releases/26.915.4065.0/ChatGPT-x64.msix'}
             }
             function script:Get-InstalledPackage {
-                $version = if ($script:Scenario -eq 'Current' -or ($script:InstallCalls -gt 0 -and $script:Scenario -ne 'Pending')) { '26.915.4065.0' } else { '26.903.8094.0' }
+                $version = if ($script:Scenario -in @('Current','FallbackNoDowngrade') -or ($script:InstallCalls -gt 0 -and $script:Scenario -ne 'Pending')) { '26.915.4065.0' } else { '26.903.8094.0' }
+                if ($script:Scenario -eq 'FallbackNoDowngrade') { $version = '26.912.1.0' }
+                if ($script:Scenario -eq 'FallbackOlder' -and $script:InstallCalls -gt 0) { $version = '26.910.1.0' }
                 [pscustomobject]@{Version=$version;Status='Ok'}
             }
             function script:Save-OfficialPackage {
                 param($Release,$Destination)
                 $script:DownloadCalls++
                 if ($script:Scenario -eq 'DownloadFailure') { throw 'DOWNLOAD_INCOMPLETE' }
+                if ($script:Scenario -eq 'Http404') { [InstallerTestNetwork]::Fail(404) }
+                if ($script:Scenario -eq 'Http403') { [InstallerTestNetwork]::Fail(403) }
+                if ($script:Scenario -eq 'WrappedTimeout' -or ($script:Scenario -eq 'TransientTimeout' -and $script:DownloadCalls -eq 1)) { [InstallerTestNetwork]::Timeout() }
+                if ($script:Scenario -in @('FallbackOlder','FallbackNoDowngrade','FallbackSignatureFailure') -and $Release.Uri -match '/releases/') { [InstallerTestNetwork]::Fail(404) }
+                if ($script:DownloadCalls -gt 1 -and $script:Scenario -like 'Fallback*' -and $Release.Uri -ne 'https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix') { throw 'Wrong fallback source' }
                 [IO.File]::WriteAllText($Destination,'mock-package')
             }
             function script:Confirm-OfficialPackage {
-                param($Path,$Release,$WindowsVersion)
-                if ($script:Scenario -eq 'SignatureFailure') { throw 'PACKAGE_SIGNATURE_INVALID' }
-                [pscustomobject]@{Metadata=[pscustomobject]@{Dependencies=@()};Sha256=('A'*64);SignatureStatus='Valid'}
+                param($Path,$Release,$WindowsVersion,[switch]$AllowVersionDifference)
+                if ($script:Scenario -in @('SignatureFailure','FallbackSignatureFailure')) { throw 'PACKAGE_SIGNATURE_INVALID' }
+                $version = if ($script:Scenario -in @('FallbackOlder','FallbackNoDowngrade')) { '26.910.1.0' } else { $Release.Version }
+                if (-not $AllowVersionDifference -and $Release.Version -ne $version) { throw 'PACKAGE_VERSION_MISMATCH' }
+                [pscustomobject]@{Metadata=[pscustomobject]@{Dependencies=@();Version=$version};Sha256=('A'*64);SignatureStatus='Valid'}
             }
             function script:Get-DependencyFindings {
                 param($Metadata)
@@ -167,6 +215,7 @@ try {
                 [CmdletBinding()]param($Path,[switch]$DeferRegistrationWhenPackagesAreInUse)
                 $script:InstallCalls++
                 if (-not $DeferRegistrationWhenPackagesAreInUse) { throw 'Test requires deferred registration' }
+                if ($Path -notmatch 'ChatGPTWindowsInstaller-[a-f0-9]{32}[\\/]ChatGPT-x64\.msix$' -or -not (Test-Path -LiteralPath $Path)) { throw 'Windows must receive the existing staged copy' }
                 if ($script:Scenario -eq 'PolicyFailure') { throw '0x80073D01' }
                 if ($script:Scenario -eq 'UnknownFailure') { throw 'Private C:\Users\SecretName\data token=private 0xDEADBEEF' }
             }
@@ -193,18 +242,39 @@ try {
             'Elevation' { @(10,0,0,1,1) }
             'PolicyFailure' { @(1,1,1,1,0) }
             'UnknownFailure' { @(1,1,1,1,0) }
+            'FallbackOlder' { @(0,1,2,1,0) }
+            'FallbackNoDowngrade' { @(0,0,2,1,0) }
+            'FallbackSignatureFailure' { @(1,0,2,1,0) }
+            'Http404' { @(1,0,2,1,0) }
+            'Http403' { @(1,0,1,1,0) }
+            'WrappedTimeout' { @(1,0,2,1,0) }
+            'TransientTimeout' { @(0,1,2,1,0) }
         }
         Assert-Equal $result $expected[0] ($scenario + ' exit status')
         for ($i=0; $i -lt 4; $i++) { Assert-Equal $counts[$i] $expected[$i+1] ($scenario + ' side effects ' + $i) }
+        if ($scenario -in @('FallbackOlder','FallbackNoDowngrade','Http404','Http403','WrappedTimeout')) {
+            $latestReport = Get-ChildItem -LiteralPath (Join-Path $tempRoot 'ChatGPTWindowsInstaller\reports') -Filter '*.json' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            $report = Get-Content -LiteralPath $latestReport.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+            $expectedCode = switch ($scenario) {
+                'Http404' { 'HTTP_404' }; 'Http403' { 'HTTP_403' }; 'WrappedTimeout' { '0x80072EE2' }
+                default { 'RELEASE_CHANNEL_DIFFERENCE' }
+            }
+            Assert-Equal ($expectedCode -in $report.findings.code) $true ($scenario + ' actionable finding')
+            if ($scenario -like 'Fallback*') {
+                Assert-Equal $report.packageVersion '26.910.1.0' 'Report actual signed package version'
+                Assert-Equal $report.latestVersion '26.915.4065.0' 'Retain advertised version separately'
+            }
+        }
     }
     foreach ($reportFile in Get-ChildItem -LiteralPath (Join-Path $tempRoot 'ChatGPTWindowsInstaller\reports') -Filter '*.json') {
         $contents = Get-Content -LiteralPath $reportFile.FullName -Raw -Encoding UTF8
-        Assert-Equal ($contents -match 'SecretName|token=private|S-1-5-21-|C:\\\\Users\\\\') $false 'No raw exception, username, SID, or user path in report'
+        Assert-Equal ($contents -match 'SecretName|token=private|S-1-5-21-|C:\\\\Users\\\\|proxy\.invalid|user:secret|Private proxy secret') $false 'No raw exception, username, SID, user path or proxy credentials in report'
         $null = $contents | ConvertFrom-Json -ErrorAction Stop
     }
 }
 finally {
     $env:LOCALAPPDATA = $oldLocal
+    $env:ProgramData = $oldProgramData
     Remove-Module Installer -Force -ErrorAction SilentlyContinue
     # Delete only the test-owned, resolved temporary folder.
     $resolved = [IO.Path]::GetFullPath($tempRoot)

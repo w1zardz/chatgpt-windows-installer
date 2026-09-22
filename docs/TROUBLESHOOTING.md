@@ -9,6 +9,7 @@ Run `Diagnose.cmd` first if you want a report without installation. The full bil
 | `0x80073D28`, packaged service requires admin | Requests UAC before installation | Approve as the same Windows user, or ask IT for deployment |
 | `0x80073D02`, app is in use | Uses deferred registration | Fully close and reopen ChatGPT, then verify again |
 | `0x80073D06`, newer version installed | Keeps the newer version | None; no downgrade is attempted |
+| AppX cannot open a verified file in the user-profile cache | Installs a reverified copy from a new protected ProgramData directory | If Windows still refuses it, preserve the report; no existing permissions are reset |
 | Store app unavailable or Store delivery fails | Uses the official direct MSIX route | Windows deployment policies and dependencies still apply |
 | Connection interrupted | Retries a transient transport failure once | Fix the network if retry fails |
 | `0x80073CF4`, `0x80070070`, low storage | Checks space and stops | Free space on the Windows/download drive |
@@ -21,7 +22,9 @@ Run `Diagnose.cmd` first if you want a report without installation. The full bil
 | `0x80072EE7`, DNS | Identifies the lookup failure | Repair the permitted network/DNS configuration |
 | `0x80072F8F`, TLS | Refuses an untrusted connection | Check clock, trust store and corporate TLS inspection |
 | Signature/digest errors | Refuses installation | Investigate the download and certificate trust |
-| HTTP `403` / `404` | Records status without guessing a cause | Check network policy or a changed release source |
+| Version-specific download returns HTTP `404` | Tries OpenAI's documented download for the same architecture | If both sources fail, retry later; the report preserves the HTTP status |
+| HTTP `403`, DNS or TLS failure | Reports the specific failure without changing sources | Check permitted network access, proxy or certificate configuration |
+| `RELEASE_CHANNEL_DIFFERENCE` | Reports feed and signed package versions separately; keeps newer installed versions | The feed and downloadable package may differ during publication; check again later |
 | `0x80073CF6`, registration failure | Looks for specific codes in recent events | Inspect Windows deployment events if cause remains unknown |
 | `0x80073D25`, another user's package | Reports the conflict | Other users may need to save work and sign out |
 | `0x80073D26` / `0x80073D27`, service conflict | Stops with advice | Vendor/IT investigation; no service deletion |
