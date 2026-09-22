@@ -111,10 +111,47 @@ public static class InstallerTestNetwork {
         throw new WebException("Private proxy secret", WebExceptionStatus.Timeout);
     }
 }
+// Serves bytes from an offset and can drop the connection like a real response stream.
+public sealed class InstallerTestStream : System.IO.Stream {
+    private readonly byte[] data;
+    private long position;
+    private readonly long failAt;
+    public InstallerTestStream(byte[] data, long start, long failAt) { this.data = data; this.position = start; this.failAt = failAt; }
+    public override int Read(byte[] buffer, int offset, int count) {
+        if (failAt >= 0 && position >= failAt) {
+            throw new System.IO.IOException("Unable to read data from the transport connection.", new System.Net.Sockets.SocketException(10054));
+        }
+        long limit = failAt >= 0 ? Math.Min(data.Length, failAt) : data.Length;
+        int length = (int)Math.Min(count, limit - position);
+        if (length <= 0) { return 0; }
+        Buffer.BlockCopy(data, (int)position, buffer, offset, length);
+        position += length;
+        return length;
+    }
+    public override bool CanRead { get { return true; } }
+    public override bool CanSeek { get { return false; } }
+    public override bool CanWrite { get { return false; } }
+    public override long Length { get { throw new NotSupportedException(); } }
+    public override long Position { get { return position; } set { throw new NotSupportedException(); } }
+    public override void Flush() { }
+    public override long Seek(long offset, System.IO.SeekOrigin origin) { throw new NotSupportedException(); }
+    public override void SetLength(long value) { throw new NotSupportedException(); }
+    public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
+}
 '@
 try { [InstallerTestNetwork]::Fail(404) } catch {
     $network = & $module { param($Record) Get-NetworkException $Record } $_
     Assert-Equal ([int]$network.Response.StatusCode) 404 'Find HTTP 404 inside method invocation wrapper'
+}
+foreach ($case in @(
+    @({ throw (New-Object IO.IOException('Unable to read data from the transport connection.', (New-Object Net.Sockets.SocketException(10054)))) }, $true, 'Dropped connection is transient'),
+    @({ throw (New-Object IO.IOException('There is not enough space on the disk.', -2147024784)) }, $false, 'Full disk is not transient'),
+    @({ [InstallerTestNetwork]::Timeout() }, $true, 'Wrapped timeout is transient'),
+    @({ [InstallerTestNetwork]::Fail(403) }, $false, 'HTTP 403 is not transient')
+)) {
+    $caught = $false
+    try { & $case[0] } catch { $caught = $true; Assert-Equal (& $module { param($Record) Test-TransientNetworkFailure $Record } $_) $case[1] $case[2] }
+    Assert-Equal $caught $true ($case[2] + ' fixture threw')
 }
 $catalog = Get-Content -LiteralPath (Join-Path $root 'src\errors.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 Assert-Equal @($catalog.code | Select-Object -Unique).Count $catalog.Count 'Unique error mappings'
@@ -147,7 +184,8 @@ $oldProgramData = $env:ProgramData
 try {
     # Execute the real encoded handoff command in a child Windows PowerShell,
     # replacing only the UAC launch and the fixture's installation work.
-    $handoffFixture = Join-Path $tempRoot "handoff user's fixture.ps1"
+    # U+2019 is also a PowerShell quote character, like the ASCII apostrophe.
+    $handoffFixture = Join-Path $tempRoot ("handoff user's O" + [char]0x2019 + "Brien fixture.ps1")
     & $module {
         function script:Start-Process {
             param($FilePath,$Verb,$WindowStyle,[switch]$Wait,[switch]$PassThru,$ArgumentList)
@@ -160,6 +198,9 @@ try {
         $handoffCode = & $module { param($Entry) Start-ElevatedInstaller -EntryPath $Entry -Language en -CallerSid 'S-1-5-21-1-1001' -NoPause } $handoffFixture
         Assert-Equal $handoffCode $code ('Preserve exit code through encoded handoff: ' + $code)
     }
+    # A script the administrator window cannot start (moved folder, unmapped drive) is not a success.
+    $missingCode = & $module { param($Entry) Start-ElevatedInstaller -EntryPath $Entry -Language en -CallerSid 'S-1-5-21-1-1001' -NoPause } (Join-Path $tempRoot 'moved folder\Install-ChatGPT.ps1')
+    Assert-Equal $missingCode 3 'Unstartable elevated script returns 3'
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zipPath = Join-Path $tempRoot 'test.msix'
@@ -174,16 +215,24 @@ try {
     # Full workflow simulations. All package mutations and elevation are mocked.
     $env:LOCALAPPDATA = $tempRoot
     $env:ProgramData = $tempRoot
-    foreach ($scenario in @('Current','Update','Pending','SignatureFailure','DownloadFailure','ChangedAccount','Offline','MissingDependency','Elevation','PolicyFailure','UnknownFailure','FallbackOlder','FallbackNoDowngrade','FallbackSignatureFailure','Http404','Http403','WrappedTimeout','TransientTimeout')) {
+    $interactiveScenarios = @('WaitForAppExit','ReopenedDuringInstall','StillOpen')
+    foreach ($scenario in @('Current','Update','Pending','SignatureFailure','DownloadFailure','ChangedAccount','Offline','MissingDependency','Elevation','ElevationStartFailure','ElevationClosed','PolicyFailure','UnknownFailure','FallbackOlder','FallbackNoDowngrade','FallbackSignatureFailure','Http404','Http403','WrappedTimeout','TransientTimeout','SocketDrop','SocketDropRepeated') + $interactiveScenarios) {
         Remove-Module Installer -Force
         $module = Import-Module $modulePath -Force -DisableNameChecking -PassThru
         & $module {
             param($Scenario)
             $script:Scenario = $Scenario
             $script:MutexName = 'Local\ChatGPTWindowsInstaller.Tests.' + $PID
-            $script:InstallCalls = 0; $script:DownloadCalls = 0; $script:FeedCalls = 0; $script:ElevationCalls = 0
+            $script:InstallCalls = 0; $script:DownloadCalls = 0; $script:FeedCalls = 0; $script:ElevationCalls = 0; $script:ProcessPolls = 0
             function script:Get-CurrentUserSid { 'S-1-5-21-1-1001' }
-            function script:Test-IsAdministrator { $script:Scenario -ne 'Elevation' }
+            function script:Test-IsAdministrator { $script:Scenario -notlike 'Elevation*' }
+            function script:Start-Sleep { param($Seconds) }
+            function script:Get-RunningAppProcess {
+                $script:ProcessPolls++
+                # WaitForAppExit: open for two polls. ReopenedDuringInstall: reopened after the first install.
+                if (($script:Scenario -eq 'WaitForAppExit' -and $script:ProcessPolls -le 2) -or ($script:Scenario -eq 'ReopenedDuringInstall' -and $script:ProcessPolls -eq 2)) { return @([pscustomobject]@{ ProcessName = 'ChatGPT' }) }
+                return @()
+            }
             function script:Get-SystemSnapshot {
                 [pscustomobject]@{windowsVersion='10.0.26100.0';architecture='x64';availableDiskBytes=@(10GB);pendingReboot=$false;services=@();configuredPolicies=@();legacyAppDetected=$false}
             }
@@ -199,18 +248,22 @@ try {
                 [pscustomobject]@{Version='26.915.4065.0';Architecture='x64';Uri='https://persistent.oaistatic.com/codex-app-prod/releases/26.915.4065.0/ChatGPT-x64.msix'}
             }
             function script:Get-InstalledPackage {
-                $version = if ($script:Scenario -in @('Current','FallbackNoDowngrade') -or ($script:InstallCalls -gt 0 -and $script:Scenario -ne 'Pending')) { '26.915.4065.0' } else { '26.903.8094.0' }
+                # Registration completes on the first install unless ChatGPT stayed open (deferred).
+                $registered = $script:InstallCalls -gt 0 -and $script:Scenario -notin @('Pending','StillOpen')
+                if ($script:Scenario -eq 'ReopenedDuringInstall') { $registered = $script:InstallCalls -ge 2 }
+                $version = if ($script:Scenario -in @('Current','FallbackNoDowngrade') -or $registered) { '26.915.4065.0' } else { '26.903.8094.0' }
                 if ($script:Scenario -eq 'FallbackNoDowngrade') { $version = '26.912.1.0' }
                 if ($script:Scenario -eq 'FallbackOlder' -and $script:InstallCalls -gt 0) { $version = '26.910.1.0' }
                 [pscustomobject]@{Version=$version;Status='Ok'}
             }
             function script:Save-OfficialPackage {
-                param($Release,$Destination)
+                param($Release,$Destination,$ResumeState)
                 $script:DownloadCalls++
                 if ($script:Scenario -eq 'DownloadFailure') { throw 'DOWNLOAD_INCOMPLETE' }
                 if ($script:Scenario -eq 'Http404') { [InstallerTestNetwork]::Fail(404) }
                 if ($script:Scenario -eq 'Http403') { [InstallerTestNetwork]::Fail(403) }
                 if ($script:Scenario -eq 'WrappedTimeout' -or ($script:Scenario -eq 'TransientTimeout' -and $script:DownloadCalls -eq 1)) { [InstallerTestNetwork]::Timeout() }
+                if ($script:Scenario -eq 'SocketDropRepeated' -or ($script:Scenario -eq 'SocketDrop' -and $script:DownloadCalls -eq 1)) { throw (New-Object IO.IOException('Unable to read data from the transport connection.', (New-Object Net.Sockets.SocketException(10054)))) }
                 if ($script:Scenario -in @('FallbackOlder','FallbackNoDowngrade','FallbackSignatureFailure') -and $Release.Uri -match '/releases/') { [InstallerTestNetwork]::Fail(404) }
                 if ($script:DownloadCalls -gt 1 -and $script:Scenario -like 'Fallback*' -and $Release.Uri -ne 'https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix') { throw 'Wrong fallback source' }
                 [IO.File]::WriteAllText($Destination,'mock-package')
@@ -237,41 +290,55 @@ try {
             function script:Start-ElevatedInstaller {
                 param($EntryPath,$Language,$CallerSid,[switch]$NoPause)
                 $script:ElevationCalls++
+                if ($script:Scenario -eq 'ElevationStartFailure') { return 3 }
+                if ($script:Scenario -eq 'ElevationClosed') { return -1073741510 }
                 return 10
             }
         } $scenario
-        $params = @{ Mode='Auto'; Language='en'; NoPause=$true; EntryPath=(Join-Path $root 'Install-ChatGPT.ps1') }
+        $handoffResult = [ref]$false
+        $params = @{ Mode='Auto'; Language='en'; NoPause=($scenario -notin $interactiveScenarios); EntryPath=(Join-Path $root 'Install-ChatGPT.ps1'); Handoff=$handoffResult }
         if ($scenario -eq 'ChangedAccount') { $params.CallerSid='S-1-5-21-2-1002' }
         if ($scenario -eq 'Offline') { $params.Mode='Diagnose'; $params.Offline=$true }
         $result = Invoke-ChatGPTInstaller @params 6>$null
-        $counts = & $module { @($script:InstallCalls, $script:DownloadCalls, $script:FeedCalls, $script:ElevationCalls) }
+        $counts = & $module { @($script:InstallCalls, $script:DownloadCalls, $script:FeedCalls, $script:ElevationCalls, $script:ProcessPolls) }
+        # Exit status, installs, downloads, feed checks, elevations, ChatGPT process checks.
         $expected = switch ($scenario) {
-            'Current' { @(0,0,0,1,0) }
-            'Update' { @(0,1,1,1,0) }
-            'Pending' { @(10,1,1,1,0) }
-            'SignatureFailure' { @(1,0,1,1,0) }
-            'DownloadFailure' { @(1,0,1,1,0) }
-            'ChangedAccount' { @(2,0,0,0,0) }
-            'Offline' { @(0,0,0,0,0) }
-            'MissingDependency' { @(2,0,1,1,0) }
-            'Elevation' { @(10,0,0,1,1) }
-            'PolicyFailure' { @(1,1,1,1,0) }
-            'UnknownFailure' { @(1,1,1,1,0) }
-            'FallbackOlder' { @(0,1,2,1,0) }
-            'FallbackNoDowngrade' { @(0,0,2,1,0) }
-            'FallbackSignatureFailure' { @(1,0,2,1,0) }
-            'Http404' { @(1,0,2,1,0) }
-            'Http403' { @(1,0,1,1,0) }
-            'WrappedTimeout' { @(1,0,2,1,0) }
-            'TransientTimeout' { @(0,1,2,1,0) }
+            'Current' { @(0,0,0,1,0,0) }
+            'Update' { @(0,1,1,1,0,0) }
+            'Pending' { @(10,1,1,1,0,0) }
+            'SignatureFailure' { @(1,0,1,1,0,0) }
+            'DownloadFailure' { @(1,0,1,1,0,0) }
+            'ChangedAccount' { @(2,0,0,0,0,0) }
+            'Offline' { @(0,0,0,0,0,0) }
+            'MissingDependency' { @(2,0,1,1,0,0) }
+            'Elevation' { @(10,0,0,1,1,0) }
+            'ElevationStartFailure' { @(3,0,0,1,1,0) }
+            'ElevationClosed' { @(1,0,0,1,1,0) }
+            'PolicyFailure' { @(1,1,1,1,0,0) }
+            'UnknownFailure' { @(1,1,1,1,0,0) }
+            'FallbackOlder' { @(0,1,2,1,0,0) }
+            'FallbackNoDowngrade' { @(0,0,2,1,0,0) }
+            'FallbackSignatureFailure' { @(1,0,2,1,0,0) }
+            'Http404' { @(1,0,2,1,0,0) }
+            'Http403' { @(1,0,1,1,0,0) }
+            'WrappedTimeout' { @(1,0,5,1,0,0) }
+            'TransientTimeout' { @(0,1,2,1,0,0) }
+            'SocketDrop' { @(0,1,2,1,0,0) }
+            'SocketDropRepeated' { @(1,0,5,1,0,0) }
+            'WaitForAppExit' { @(0,1,1,1,0,3) }
+            'ReopenedDuringInstall' { @(0,2,1,1,0,3) }
+            'StillOpen' { @(10,3,1,1,0,3) }
         }
         Assert-Equal $result $expected[0] ($scenario + ' exit status')
-        for ($i=0; $i -lt 4; $i++) { Assert-Equal $counts[$i] $expected[$i+1] ($scenario + ' side effects ' + $i) }
-        if ($scenario -in @('FallbackOlder','FallbackNoDowngrade','Http404','Http403','WrappedTimeout')) {
+        for ($i=0; $i -lt 5; $i++) { Assert-Equal $counts[$i] $expected[$i+1] ($scenario + ' side effects ' + $i) }
+        # Only a completed handoff suppresses the launcher's pause; failures must stay visible.
+        Assert-Equal $handoffResult.Value ($scenario -eq 'Elevation') ($scenario + ' handoff')
+        if ($scenario -in @('FallbackOlder','FallbackNoDowngrade','Http404','Http403','WrappedTimeout','SocketDropRepeated','ElevationStartFailure','ElevationClosed')) {
             $latestReport = Get-ChildItem -LiteralPath (Join-Path $tempRoot 'ChatGPTWindowsInstaller\reports') -Filter '*.json' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
             $report = Get-Content -LiteralPath $latestReport.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
             $expectedCode = switch ($scenario) {
-                'Http404' { 'HTTP_404' }; 'Http403' { 'HTTP_403' }; 'WrappedTimeout' { '0x80072EE2' }
+                'Http404' { 'HTTP_404' }; 'Http403' { 'HTTP_403' }; 'WrappedTimeout' { '0x80072EE2' }; 'SocketDropRepeated' { '0x80072EFD' }
+                'ElevationStartFailure' { 'ELEVATED_START_FAILED' }; 'ElevationClosed' { 'ELEVATED_WINDOW_CLOSED' }
                 default { 'RELEASE_CHANNEL_DIFFERENCE' }
             }
             Assert-Equal ($expectedCode -in $report.findings.code) $true ($scenario + ' actionable finding')
@@ -285,6 +352,120 @@ try {
         $contents = Get-Content -LiteralPath $reportFile.FullName -Raw -Encoding UTF8
         Assert-Equal ($contents -match 'SecretName|token=private|S-1-5-21-|C:\\\\Users\\\\|proxy\.invalid|user:secret|Private proxy secret') $false 'No raw exception, username, SID, user path or proxy credentials in report'
         $null = $contents | ConvertFrom-Json -ErrorAction Stop
+    }
+    Assert-Equal (@(Get-ChildItem -LiteralPath (Join-Path $tempRoot 'ChatGPTWindowsInstaller\reports') -File).Count -le 40) $true 'Reports are limited to the newest 20 runs'
+
+    # Real download code with a scripted server: drop the connection, then resume with If-Range.
+    Remove-Module Installer -Force
+    $module = Import-Module $modulePath -Force -DisableNameChecking -PassThru
+    $packageBytes = New-Object byte[] 4096
+    for ($i = 0; $i -lt $packageBytes.Length; $i++) { $packageBytes[$i] = [byte]($i % 251) }
+    & $module {
+        param([byte[]]$Bytes)
+        $script:PackageBytes = $Bytes
+        $script:FailAt = 1500
+        $script:ResponseLog = New-Object Collections.ArrayList
+        function script:New-TestResponse {
+            param([int]$Status, [long]$Length, [hashtable]$Headers, $Stream)
+            $response = [pscustomobject]@{ StatusCode = $Status; ContentLength = $Length; Headers = $Headers; Stream = $Stream }
+            $response | Add-Member -MemberType ScriptMethod -Name GetResponseStream -Value { $this.Stream }
+            $response | Add-Member -MemberType ScriptMethod -Name Close -Value { }
+            return $response
+        }
+        function script:Get-OfficialResponse {
+            param([string]$Uri, [long]$Offset = 0, [string]$Validator)
+            [void]$script:ResponseLog.Add(('{0}|{1}' -f $Offset, $Validator))
+            $size = $script:PackageBytes.Length
+            if ($Offset -eq 0) { return New-TestResponse 200 $size @{ ETag = '"v1"' } ([InstallerTestStream]::new($script:PackageBytes, 0, $script:FailAt)) }
+            if ($Validator -ceq '"v1"') { return New-TestResponse 206 ($size - $Offset) @{ ETag = '"v1"'; 'Content-Range' = ('bytes {0}-{1}/{2}' -f $Offset, ($size - 1), $size) } ([InstallerTestStream]::new($script:PackageBytes, $Offset, -1)) }
+            # The file changed on the server: If-Range yields the whole new file.
+            return New-TestResponse 200 $size @{ ETag = '"v2"' } ([InstallerTestStream]::new($script:PackageBytes, 0, -1))
+        }
+    } $packageBytes
+    $resumeDirectory = Join-Path $tempRoot 'resume'
+    $null = New-Item -ItemType Directory -Path $resumeDirectory
+    $resumeTarget = Join-Path $resumeDirectory 'ChatGPT-x64.msix'
+    $resumeRelease = [pscustomobject]@{ Uri = 'https://persistent.oaistatic.com/codex-app-prod/releases/26.915.4065.0/ChatGPT-x64.msix' }
+    $resumeState = @{}
+    $saveScript = { param($Release, $Destination, $State) Save-OfficialPackage $Release $Destination $State }
+    Assert-Throws { & $module $saveScript $resumeRelease $resumeTarget $resumeState } 'transport connection' 'Dropped download reports the transport error'
+    Assert-Equal (Get-Item -LiteralPath $resumeTarget).Length 1500 'Partial download is kept for resuming'
+    Assert-Equal $resumeState['Validator'] '"v1"' 'Strong ETag is kept for If-Range'
+    & $module $saveScript $resumeRelease $resumeTarget $resumeState
+    Assert-Equal ([Convert]::ToBase64String([IO.File]::ReadAllBytes($resumeTarget))) ([Convert]::ToBase64String($packageBytes)) 'Resumed file matches the original bytes'
+    Assert-Equal ((& $module { $script:ResponseLog }) -join ',') '0|,1500|"v1"' 'Second request resumes at the partial length with If-Range'
+    [IO.File]::WriteAllBytes($resumeTarget, [byte[]](7, 7, 7))
+    $resumeState['Validator'] = '"stale"'
+    & $module $saveScript $resumeRelease $resumeTarget $resumeState
+    Assert-Equal ([Convert]::ToBase64String([IO.File]::ReadAllBytes($resumeTarget))) ([Convert]::ToBase64String($packageBytes)) 'Changed server file replaces the partial file'
+    Assert-Equal $resumeState['Validator'] '"v2"' 'New validator is kept after a full response'
+
+    # Leftovers from interrupted runs: only this tool's package names, in old run folders, are removed.
+    $staleRoot = Join-Path $tempRoot 'stale-cache'
+    $staleTime = (Get-Date).AddDays(-2)
+    $staleFolders = @{}
+    foreach ($folder in @(@(('a' * 32), 'ChatGPT-x64.msix', $staleTime), @(('b' * 32), 'ChatGPT-arm64.msix|keep.txt', $staleTime), @(('c' * 32), 'ChatGPT-x64.msix', (Get-Date)), @('not-a-run-folder', 'ChatGPT-x64.msix', $staleTime))) {
+        $directory = Join-Path $staleRoot $folder[0]
+        $null = New-Item -ItemType Directory -Path $directory -Force
+        foreach ($name in $folder[1].Split('|')) { 'fixture' | Set-Content -LiteralPath (Join-Path $directory $name) }
+        (Get-Item -LiteralPath $directory).LastWriteTime = $folder[2]
+        $staleFolders[$folder[0]] = $directory
+    }
+    & $module { param($Root) Clear-StaleInstallerFiles $Root $null } $staleRoot
+    Assert-Equal (Test-Path -LiteralPath $staleFolders[('a' * 32)]) $false 'Stale run folder with only a package is removed'
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $staleFolders[('b' * 32)] 'ChatGPT-arm64.msix')) $false 'Stale package is removed'
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $staleFolders[('b' * 32)] 'keep.txt')) $true 'Unknown files are never removed'
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $staleFolders[('c' * 32)] 'ChatGPT-x64.msix')) $true 'Recent run folder is untouched'
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $staleFolders['not-a-run-folder'] 'ChatGPT-x64.msix')) $true 'Foreign folder is untouched'
+    if (& $module { Test-IsAdministrator }) {
+        # Needs elevation to create the real protected staging folder (CI runners are elevated).
+        $stagingTestRoot = Join-Path $tempRoot 'stale-staging'
+        $null = New-Item -ItemType Directory -Path $stagingTestRoot
+        $env:ProgramData = $stagingTestRoot
+        $protectedFolder = & $module { New-ProtectedStagingDirectory }
+        'fixture' | Set-Content -LiteralPath (Join-Path $protectedFolder 'ChatGPT-x64.msix')
+        (Get-Item -LiteralPath $protectedFolder).LastWriteTime = $staleTime
+        & $module { param($Root) Clear-StaleInstallerFiles $null $Root } $stagingTestRoot
+        Assert-Equal (Test-Path -LiteralPath $protectedFolder) $false 'Stale protected staging folder is removed'
+        $env:ProgramData = $tempRoot
+    }
+
+    # Report rotation keeps the newest 40 files (20 runs).
+    $rotationRoot = Join-Path $tempRoot 'rotation'
+    $null = New-Item -ItemType Directory -Path $rotationRoot
+    for ($i = 0; $i -lt 45; $i++) {
+        $oldReport = Join-Path $rotationRoot ('report-20260101-0000{0:D2}-abcdef.txt' -f $i)
+        'old' | Set-Content -LiteralPath $oldReport
+        (Get-Item -LiteralPath $oldReport).LastWriteTime = (Get-Date).AddDays(-10).AddMinutes($i)
+    }
+    'unrelated' | Set-Content -LiteralPath (Join-Path $rotationRoot 'notes.txt')
+    $rotationReport = [ordered]@{ outcome = 'Current'; generatedUtc = 'test'; system = $null; latestVersion = '1.0.0.0'; packageVersion = $null; installedVersionAfter = $null; findings = @() }
+    $newReport = & $module { param($Report, $Directory) Write-Report $Report $Directory } $rotationReport $rotationRoot
+    Assert-Equal @(Get-ChildItem -LiteralPath $rotationRoot -Filter 'report-*').Count 40 'Old reports are rotated'
+    Assert-Equal (Test-Path -LiteralPath $newReport) $true 'Newest report is kept'
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $rotationRoot 'report-20260101-000000-abcdef.txt')) $false 'Oldest report is removed'
+    Assert-Equal (Test-Path -LiteralPath (Join-Path $rotationRoot 'notes.txt')) $true 'Unrelated files are kept'
+
+    # The real process check must be quick and quiet: the elevated window polls it.
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $null = & $module { @(Get-RunningAppProcess).Count }
+    Assert-Equal ($timer.Elapsed.TotalSeconds -lt 10) $true 'ChatGPT process check completes'
+
+    if ($PSVersionTable.PSEdition -eq 'Desktop') {
+        # A window started with "Run as administrator" holds a lock a standard window cannot open.
+        $deniedName = 'Local\ChatGPTWindowsInstaller.Tests.Denied.' + $PID
+        $mutexSecurity = New-Object Security.AccessControl.MutexSecurity
+        $mutexSecurity.AddAccessRule((New-Object Security.AccessControl.MutexAccessRule([Security.Principal.WindowsIdentity]::GetCurrent().User, [Security.AccessControl.MutexRights]::FullControl, [Security.AccessControl.AccessControlType]::Deny)))
+        $createdNew = $false
+        $deniedMutex = [Threading.Mutex]::new($false, $deniedName, [ref]$createdNew, $mutexSecurity)
+        try {
+            & $module { param($Name) $script:MutexName = $Name } $deniedName
+            $deniedResult = Invoke-ChatGPTInstaller -Mode Auto -Language en -NoPause -EntryPath (Join-Path $root 'Install-ChatGPT.ps1') 6>$null
+            Assert-Equal $deniedResult 1 'Inaccessible lock stops the second window'
+            $latestReport = Get-ChildItem -LiteralPath (Join-Path $tempRoot 'ChatGPTWindowsInstaller\reports') -Filter '*.json' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            $report = Get-Content -LiteralPath $latestReport.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+            Assert-Equal ('ANOTHER_INSTANCE' -in $report.findings.code) $true 'Inaccessible lock is reported as another running copy'
+        } finally { $deniedMutex.Dispose() }
     }
 }
 finally {

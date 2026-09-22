@@ -5,12 +5,14 @@ Diagnose, install, or update the official ChatGPT desktop app for Windows.
 .DESCRIPTION
 Double-click Start.cmd for automatic mode. Diagnose.cmd never installs an app.
 The installer asks Windows for administrator consent when an update is needed.
+If ChatGPT is open, the administrator window waits until it is closed, then installs.
 #>
 [CmdletBinding()]
 param(
     [ValidateSet('Auto', 'Diagnose', 'Download')][string]$Mode = 'Auto',
     [ValidateSet('Auto', 'en', 'ru')][string]$Language = 'Auto',
     [switch]$Offline,
+    # Non-interactive: no final pause and no waiting for ChatGPT to close.
     [switch]$NoPause,
     # Internal UAC handoff: never install into a different administrator account.
     [string]$CallerSid

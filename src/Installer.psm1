@@ -1,6 +1,6 @@
 ﻿#Requires -Version 5.1
 Set-StrictMode -Version 2.0
-$script:ToolVersion = '1.0.2'
+$script:ToolVersion = '1.0.3'
 $script:PackageIdentity = 'OpenAI.Codex'
 $script:PackagePublisher = 'CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B'
 $script:FeedUri = 'https://persistent.oaistatic.com/codex-app-prod/windows-store-update.json'
@@ -118,6 +118,18 @@ function Get-NetworkException {
     return $null
 }
 
+function Test-TransientNetworkFailure {
+    param($ErrorRecord)
+    # A connection dropped mid-download surfaces as IOException wrapping SocketException, not WebException.
+    $exception = $ErrorRecord.Exception
+    for ($depth = 0; $exception -and $depth -lt 8; $depth++) {
+        if ($exception -is [Net.WebException]) { return $exception.Status -in @([Net.WebExceptionStatus]::Timeout, [Net.WebExceptionStatus]::ConnectionClosed, [Net.WebExceptionStatus]::ReceiveFailure, [Net.WebExceptionStatus]::ConnectFailure, [Net.WebExceptionStatus]::KeepAliveFailure) }
+        if ($exception -is [Net.Sockets.SocketException]) { return $true }
+        $exception = $exception.InnerException
+    }
+    return $false
+}
+
 function ConvertTo-Release {
     param($Feed, [ValidateSet('x64', 'arm64')][string]$Architecture)
     if (-not $Feed -or -not ($Feed.PSObject.Properties.Name -contains 'schemaVersion') -or $Feed.schemaVersion -ne 1) { throw 'FEED_FORMAT_CHANGED' }
@@ -145,7 +157,7 @@ function Assert-OfficialUri {
 }
 
 function Get-OfficialResponse {
-    param([string]$Uri)
+    param([string]$Uri, [long]$Offset = 0, [string]$Validator)
     Assert-OfficialUri $Uri
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     $request = [Net.HttpWebRequest]::Create($Uri)
@@ -153,9 +165,16 @@ function Get-OfficialResponse {
     $request.Timeout = 30000
     $request.ReadWriteTimeout = 60000
     $request.UserAgent = 'ChatGPT-Windows-Installer/' + $script:ToolVersion
+    if ($Offset -gt 0) {
+        # If-Range makes the server resend the whole file when it changed since the interrupted attempt.
+        if (-not $Validator) { throw 'DOWNLOAD_RANGE_INVALID' }
+        $request.AddRange($Offset)
+        $request.Headers.Add('If-Range', $Validator)
+    }
     # Use Windows' configured proxy; never print its address or credentials.
     $response = $request.GetResponse()
-    if ([int]$response.StatusCode -ne 200) { $response.Close(); throw 'UNEXPECTED_HTTP_STATUS' }
+    $status = [int]$response.StatusCode
+    if ($status -ne 200 -and -not ($Offset -gt 0 -and $status -eq 206)) { $response.Close(); throw 'UNEXPECTED_HTTP_STATUS' }
     return $response
 }
 
@@ -273,24 +292,49 @@ function Get-RecentDeploymentErrors {
 }
 
 function Save-OfficialPackage {
-    param($Release, [string]$Destination)
-    $response = Get-OfficialResponse $Release.Uri
+    param($Release, [string]$Destination, [hashtable]$ResumeState)
+    # Resume only this run's partial file, from the same URL, guarded by the server's validator.
+    [long]$offset = 0
+    if ($ResumeState -and $ResumeState['Uri'] -ceq $Release.Uri -and $ResumeState['Validator'] -and (Test-Path -LiteralPath $Destination)) {
+        $offset = (Get-Item -LiteralPath $Destination).Length
+        if ($offset -ge [long]$ResumeState['Size']) { $offset = 0 }
+    }
+    $validator = $null
+    if ($offset -gt 0) { $validator = $ResumeState['Validator'] }
+    $response = Get-OfficialResponse $Release.Uri $offset $validator
     try {
-        $size = $response.ContentLength
+        $mode = [IO.FileMode]::Create
+        if ($offset -gt 0 -and [int]$response.StatusCode -eq 206) {
+            $size = [long]$ResumeState['Size']
+            $expectedRange = 'bytes ' + $offset + '-' + ($size - 1) + '/' + $size
+            if ([string]$response.Headers['Content-Range'] -cne $expectedRange -or $response.ContentLength -ne $size - $offset) { throw 'DOWNLOAD_RANGE_INVALID' }
+            $mode = [IO.FileMode]::Append
+        } else {
+            # A full response replaces any partial file.
+            $offset = 0
+            $size = $response.ContentLength
+        }
         if ($size -le 0 -or $size -gt 4GB) { throw 'PACKAGE_SIZE_INVALID' }
         foreach ($root in @([IO.Path]::GetPathRoot($Destination), [IO.Path]::GetPathRoot($env:SystemRoot)) | Select-Object -Unique) {
-            if ((New-Object IO.DriveInfo($root)).AvailableFreeSpace -lt (3 * $size + 512MB)) { throw '0x80073CF4' }
+            if ((New-Object IO.DriveInfo($root)).AvailableFreeSpace -lt (3 * $size + 512MB - $offset)) { throw '0x80073CF4' }
+        }
+        if ($null -ne $ResumeState) {
+            $etag = [string]$response.Headers['ETag']
+            $ResumeState['Uri'] = $Release.Uri
+            $ResumeState['Validator'] = if ($etag -and -not $etag.StartsWith('W/')) { $etag } else { [string]$response.Headers['Last-Modified'] }
+            $ResumeState['Size'] = $size
         }
         $inputStream = $response.GetResponseStream()
-        $outputStream = [IO.File]::Open($Destination, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $outputStream = [IO.File]::Open($Destination, $mode, [IO.FileAccess]::Write, [IO.FileShare]::None)
         try {
             $buffer = New-Object byte[] 1048576
-            [long]$total = 0
+            [long]$total = $offset
             $timer = [Diagnostics.Stopwatch]::StartNew()
             [long]$nextProgressMs = 0
             while (($read = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
                 $total += $read
-                if ($total -gt $size -or $total -gt 4GB -or $timer.Elapsed.TotalMinutes -gt 30) { throw 'DOWNLOAD_LIMIT_EXCEEDED' }
+                # A stalled connection fails after ReadWriteTimeout; a slow but working one may need hours.
+                if ($total -gt $size -or $total -gt 4GB -or $timer.Elapsed.TotalHours -gt 6) { throw 'DOWNLOAD_LIMIT_EXCEEDED' }
                 $outputStream.Write($buffer, 0, $read)
                 if ($timer.ElapsedMilliseconds -ge $nextProgressMs -or $total -eq $size) {
                     Write-Progress -Activity (Get-Text 'Downloading official ChatGPT package' 'Загрузка официального пакета ChatGPT') -Status ('{0:N0} / {1:N0} MB' -f ($total / 1MB), ($size / 1MB)) -PercentComplete ([int](100 * $total / $size))
@@ -306,9 +350,9 @@ function Save-OfficialPackage {
 }
 
 function Save-ReleasePackage {
-    param($Release, [string]$Destination)
+    param($Release, [string]$Destination, [hashtable]$ResumeState)
     try {
-        Save-OfficialPackage $Release $Destination
+        Save-OfficialPackage $Release $Destination $ResumeState
         return [pscustomobject]@{ Release = $Release; UsedFallback = $false }
     } catch {
         $network = Get-NetworkException $_
@@ -321,7 +365,7 @@ function Save-ReleasePackage {
         Version = $Release.Version; Architecture = $Release.Architecture
         Uri = 'https://persistent.oaistatic.com/codex-app-prod/ChatGPT-' + $Release.Architecture + '.msix'
     }
-    Save-OfficialPackage $fallback $Destination
+    Save-OfficialPackage $fallback $Destination $ResumeState
     return [pscustomobject]@{ Release = $fallback; UsedFallback = $true }
 }
 
@@ -395,6 +439,35 @@ function Get-InstallOutcome {
     return 'PendingRegistration'
 }
 
+function Get-RunningAppProcess {
+    # Only this Windows session's ChatGPT processes keep the package in use for this user.
+    $session = (Get-Process -Id $PID).SessionId
+    $marker = '\WindowsApps\' + $script:PackageIdentity + '_'
+    return @([Diagnostics.Process]::GetProcesses() | Where-Object { $_.SessionId -eq $session } | Where-Object {
+        try { $_.MainModule.FileName.IndexOf($marker, [StringComparison]::OrdinalIgnoreCase) -ge 0 } catch { $false }
+    })
+}
+
+function Wait-AppExit {
+    # Windows retries a deferred registration without administrator rights when ChatGPT starts again,
+    # which fails with 0x80073D28 for this package's service. Install here after ChatGPT has closed.
+    $announced = $false
+    $shownNames = ''
+    while ($true) {
+        $running = @(Get-RunningAppProcess)
+        if ($running.Count -eq 0) { break }
+        if (-not $announced) {
+            Write-Step 'ChatGPT is open. Save your work and quit ChatGPT completely, including its icon near the clock. Installation continues automatically after it closes; nothing is closed by force. To postpone, close this window.' 'ChatGPT открыт. Сохраните работу и полностью закройте ChatGPT, включая значок возле часов. Установка продолжится автоматически после закрытия; ничего не закрывается принудительно. Чтобы отложить, закройте это окно.' Yellow
+            $announced = $true
+        }
+        # Name what still runs from the package, e.g. a helper left after the main window closed.
+        $names = @($running | ForEach-Object { $_.ProcessName } | Sort-Object -Unique) -join ', '
+        if ($names -ne $shownNames) { Write-Step ('Still running: ' + $names) ('Ещё работают: ' + $names); $shownNames = $names }
+        Start-Sleep -Seconds 2
+    }
+    if ($announced) { Write-Step 'ChatGPT is closed. Do not open it until installation finishes.' 'ChatGPT закрыт. Не открывайте его, пока установка не завершится.' }
+}
+
 function New-ProtectedStagingDirectory {
     # AppX's service may not be able to open a package in a user's profile.
     # Create a new directory atomically with explicit, non-inherited permissions.
@@ -419,8 +492,55 @@ function New-ProtectedStagingDirectory {
     return $directory.FullName
 }
 
+function Remove-InstallerFile {
+    param([string]$Path)
+    # Security software may still be scanning a large new file; retry briefly instead of leaving it behind.
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        if (-not (Test-Path -LiteralPath $Path)) { return $true }
+        try { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop } catch { Start-Sleep -Seconds 1 }
+    }
+    return -not (Test-Path -LiteralPath $Path)
+}
+
+function Remove-EmptyDirectory {
+    param([string]$Path)
+    # Unlike Remove-Item, this never prompts or deletes contents: a non-empty directory is kept.
+    try { [IO.Directory]::Delete($Path, $false) } catch { }
+}
+
+function Get-DirectoryOwnerSid {
+    param([string]$Path)
+    try { return (Get-Acl -LiteralPath $Path).GetOwner([Security.Principal.SecurityIdentifier]).Value } catch { return $null }
+}
+
+function Clear-StaleInstallerFiles {
+    param([string]$CacheRoot, [string]$StagingRoot)
+    # Remove package files left by an interrupted earlier run: this tool's own names only, never
+    # recursively, never through links, and only in directories untouched for a day.
+    $cutoff = (Get-Date).AddDays(-1)
+    $directories = @()
+    if ($CacheRoot -and (Test-Path -LiteralPath $CacheRoot)) {
+        $directories += @(Get-ChildItem -LiteralPath $CacheRoot -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -cmatch '^[a-f0-9]{32}$' })
+    }
+    if ($StagingRoot -and (Test-Path -LiteralPath $StagingRoot)) {
+        # ProgramData is writable by users, so only directories owned by Administrators are ours.
+        $directories += @(Get-ChildItem -LiteralPath $StagingRoot -Directory -Filter 'ChatGPTWindowsInstaller-*' -ErrorAction SilentlyContinue | Where-Object {
+            $_.Name -cmatch '^ChatGPTWindowsInstaller-[a-f0-9]{32}$' -and (Get-DirectoryOwnerSid $_.FullName) -eq 'S-1-5-32-544'
+        })
+    }
+    foreach ($directory in $directories) {
+        if ($directory.LastWriteTime -gt $cutoff -or ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint)) { continue }
+        foreach ($file in @(Get-ChildItem -LiteralPath $directory.FullName -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -cmatch '^ChatGPT-(x64|arm64)\.msix$' -and -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) })) {
+            Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+        }
+        Remove-EmptyDirectory $directory.FullName
+    }
+}
+
 function Install-VerifiedPackage {
     param([string]$Path, $Release, [string]$WindowsVersion)
+    # Windows PowerShell draws deployment progress over earlier console lines and can leave them garbled.
+    $ProgressPreference = 'SilentlyContinue'
     $null = Confirm-OfficialPackage $Path $Release $WindowsVersion
     $stageDirectory = $null
     $stagePath = $null
@@ -437,8 +557,8 @@ function Install-VerifiedPackage {
             $resolved = [IO.Path]::GetFullPath($stageDirectory)
             $parent = [IO.Path]::GetFullPath($env:ProgramData).TrimEnd([char[]]'\/')
             if ((Split-Path $resolved -Parent) -eq $parent -and (Split-Path $resolved -Leaf) -match '^ChatGPTWindowsInstaller-[a-f0-9]{32}$') {
-                if ($stagePath -and (Test-Path -LiteralPath $stagePath)) { Remove-Item -LiteralPath $stagePath -Force -ErrorAction SilentlyContinue }
-                Remove-Item -LiteralPath $resolved -ErrorAction SilentlyContinue
+                if ($stagePath) { $null = Remove-InstallerFile $stagePath }
+                Remove-EmptyDirectory $resolved
             }
         }
     }
@@ -447,12 +567,15 @@ function Install-VerifiedPackage {
 function Start-ElevatedInstaller {
     param([string]$EntryPath, [string]$Language, [string]$CallerSid, [switch]$NoPause)
     if ($EntryPath.Contains([char]0)) { throw 'ENTRY_PATH_INVALID' }
-    $escapedPath = $EntryPath.Replace("'", "''")
+    # PowerShell also treats typographic quotes such as U+2019 as single quotes; escape all of them.
+    $escapedPath = [Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($EntryPath)
+    if (@('en', 'ru') -cnotcontains $Language) { throw 'LANGUAGE_INVALID' }
     if ($CallerSid -notmatch '^S-1-5-(\d+-)*\d+$') { throw 'CALLER_SID_INVALID' }
-    $command = "& '$escapedPath' -Mode Auto -Language '$Language' -CallerSid '$CallerSid'"
-    if ($NoPause) { $command += ' -NoPause' }
-    # -EncodedCommand otherwise collapses a script's nonzero exit code to 1.
-    $command += '; exit $LASTEXITCODE'
+    $invocation = "& '$escapedPath' -Mode Auto -Language '$Language' -CallerSid '$CallerSid'"
+    if ($NoPause) { $invocation += ' -NoPause' }
+    # A script that cannot start (moved folder, unmapped network drive) must not look like success:
+    # without try/catch the command exits 0. -EncodedCommand otherwise collapses nonzero codes to 1.
+    $command = 'try { ' + $invocation + ' } catch { exit 3 }; exit $LASTEXITCODE'
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
     $executable = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $process = Start-Process -FilePath $executable -Verb RunAs -WindowStyle Normal -Wait -PassThru -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded) -ErrorAction Stop
@@ -488,6 +611,9 @@ function Write-Report {
     $lines += 'Historical errors describe past attempts. They may already be resolved.'
     $lines += 'Исторические ошибки относятся к прошлым попыткам и уже могли быть исправлены.'
     $lines | Set-Content -LiteralPath $textFile -Encoding UTF8
+    # Keep the newest 20 runs (JSON and text).
+    $old = @(Get-ChildItem -LiteralPath $Directory -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -cmatch '^report-\d{8}-\d{6}-[a-f0-9]{6}\.(json|txt)$' } | Sort-Object LastWriteTime -Descending | Select-Object -Skip 40)
+    foreach ($file in $old) { Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue }
     return $textFile
 }
 
@@ -518,11 +644,15 @@ function Invoke-ChatGPTInstaller {
         packageSource = $null; installedVersionAfter = $null; phase = 'Preflight'
     }
     $dataRoot = Join-Path $env:LOCALAPPDATA 'ChatGPTWindowsInstaller'
+    $runRoot = $null
     $runDirectory = $null
     $reportNeeded = $true
-    $mutex = New-Object Threading.Mutex($false, $script:MutexName)
+    $mutex = $null
     $locked = $false
     try {
+        # A copy started with "Run as administrator" creates a lock that a standard window cannot open.
+        try { $mutex = New-Object Threading.Mutex($false, $script:MutexName) }
+        catch { if ($_.Exception -is [UnauthorizedAccessException] -or $_.Exception.InnerException -is [UnauthorizedAccessException]) { throw 'ANOTHER_INSTANCE' }; throw }
         try { $locked = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $locked = $true }
         if (-not $locked) { throw 'ANOTHER_INSTANCE' }
         Write-Step 'Checking Windows, installed packages, storage, policies and deployment events...' 'Проверяю Windows, пакеты, место на диске, политики и события установки...'
@@ -566,26 +696,44 @@ function Invoke-ChatGPTInstaller {
             $report.outcome = 'ActionRequired'; return 2
         }
         if ($Mode -eq 'Auto' -and -not (Test-IsAdministrator)) {
-            Write-Step 'Windows will ask for administrator permission. Approve the prompt to continue.' 'Windows запросит права администратора. Подтвердите запрос для продолжения.' Yellow
+            Write-Step 'Opening the installer as administrator. Approve the Windows prompt if one appears.' 'Открываю установку с правами администратора. Если Windows покажет запрос, подтвердите его.' Yellow
+            Write-Step 'Installation continues in the "Administrator" window. This window closes when it finishes.' 'Установка продолжится в окне «Администратор». Это окно закроется, когда она завершится.'
             # Release the per-session lock before starting the elevated copy.
             $mutex.ReleaseMutex(); $locked = $false
+            $report.phase = 'Elevation'
             $result = Start-ElevatedInstaller -EntryPath $EntryPath -Language $script:Language -CallerSid (Get-CurrentUserSid) -NoPause:$NoPause
-            $reportNeeded = $false
-            if ($null -ne $Handoff) { $Handoff.Value = $true }
-            return $result
+            if ($result -in @(0, 1, 2, 10)) {
+                # The administrator window has already shown its result and report.
+                $reportNeeded = $false
+                if ($null -ne $Handoff) { $Handoff.Value = $true }
+                return $result
+            }
+            $report.outcome = 'Failed'
+            if ($result -eq 3) {
+                $report.findings += New-Finding 'ELEVATED_START_FAILED' 'error' (Get-Text 'The administrator window could not start this tool.' 'Окно администратора не смогло запустить скрипт.') (Get-Text 'Extract the entire ZIP to a local folder such as Downloads (not a network drive), then run Start.cmd again.' 'Распакуйте весь ZIP в локальную папку, например «Загрузки» (не на сетевой диск), и снова запустите Start.cmd.')
+                return 3
+            }
+            $report.findings += New-Finding 'ELEVATED_WINDOW_CLOSED' 'error' (Get-Text ('The administrator window closed before reporting a result (code ' + $result + ').') ('Окно администратора закрылось, не сообщив результат (код ' + $result + ').')) (Get-Text 'If it had already finished or you closed it to postpone the update, nothing else is needed. Otherwise run Start.cmd again; it checks the installed version first.' 'Если установка уже завершилась или вы закрыли окно, чтобы отложить обновление, больше ничего делать не нужно. Иначе снова запустите Start.cmd: сначала он проверит установленную версию.')
+            return 1
         }
-        $runDirectory = Join-Path $dataRoot ('cache\' + [guid]::NewGuid().ToString('N'))
+        # Download mode keeps its verified package, so it never shares the folder cleaned below.
+        $runRoot = Join-Path $dataRoot $(if ($Mode -eq 'Download') { 'downloads' } else { 'cache' })
+        $stagingRoot = $null
+        if (Test-IsAdministrator) { $stagingRoot = $env:ProgramData }
+        Clear-StaleInstallerFiles (Join-Path $dataRoot 'cache') $stagingRoot
+        $runDirectory = Join-Path $runRoot ([guid]::NewGuid().ToString('N'))
         $null = New-Item -ItemType Directory -Force -Path $runDirectory
         $packagePath = Join-Path $runDirectory ('ChatGPT-' + $release.Architecture + '.msix')
         $report.phase = 'Download'
         Write-Step ('Downloading version ' + $release.Version + ' from OpenAI...') ('Загружаю версию ' + $release.Version + ' с сервера OpenAI...')
-        # One retry for a transient transport failure; never retry signature or policy failures.
-        for ($attempt = 1; $attempt -le 2; $attempt++) {
-            try { $download = Save-ReleasePackage $release $packagePath; break }
+        # Retry transient transport failures and resume the partial file; never retry signature or policy failures.
+        $resume = @{}
+        for ($attempt = 1; $attempt -le 5; $attempt++) {
+            try { $download = Save-ReleasePackage $release $packagePath $resume; break }
             catch {
-                $network = Get-NetworkException $_
-                if ($attempt -eq 2 -or -not $network -or $network.Status -notin @([Net.WebExceptionStatus]::Timeout, [Net.WebExceptionStatus]::ConnectionClosed, [Net.WebExceptionStatus]::ReceiveFailure, [Net.WebExceptionStatus]::ConnectFailure)) { throw }
-                Write-Step 'The download was interrupted; retrying once...' 'Загрузка прервалась; повторяю один раз...' Yellow
+                if ($attempt -eq 5 -or -not (Test-TransientNetworkFailure $_)) { throw }
+                Write-Step 'The download was interrupted; resuming...' 'Загрузка прервалась; продолжаю...' Yellow
+                Start-Sleep -Seconds ([int][Math]::Pow(2, $attempt - 1))
             }
         }
         Write-Step 'Verifying the Windows signature, package identity, version and compatibility...' 'Проверяю подпись Windows, издателя, версию и совместимость пакета...'
@@ -609,14 +757,25 @@ function Invoke-ChatGPTInstaller {
         if (@($report.findings | Where-Object severity -eq 'blocker').Count) { $report.outcome = 'ActionRequired'; return 2 }
         # Recheck after the download: another installer may have updated the app meanwhile.
         $decision = Get-UpdateDecision (Get-InstalledPackage) $release.Version
-        if ($decision -in @('Current', 'NewerInstalled')) { $report.outcome = $decision; return 0 }
+        if ($decision -in @('Current', 'NewerInstalled')) {
+            $report.outcome = $decision
+            Write-Step 'The verified package is not newer than the installed app. Nothing was installed.' 'Проверенный пакет не новее установленного приложения. Ничего не установлено.' Green
+            return 0
+        }
         if ($decision -eq 'NeedsRepair') { throw 'PACKAGE_STATUS_CHANGED' }
-        Write-Step 'Installing the verified package. Running applications will not be force-closed.' 'Устанавливаю проверенный пакет. Запущенные приложения не закрываются принудительно.'
-        $report.phase = 'Deployment'
-        $report.outcome = Install-VerifiedPackage $packagePath $release $snapshot.windowsVersion
-        $report.phase = 'RegistrationCheck'
+        # Deferred registration cannot finish this package later (see Wait-AppExit), so interactive runs
+        # wait for ChatGPT to close and install again if it was reopened before Windows finished.
+        for ($attempt = 1; ; $attempt++) {
+            if (-not $NoPause) { $report.phase = 'WaitingForAppExit'; Wait-AppExit }
+            Write-Step 'Installing the verified package. Running applications will not be force-closed.' 'Устанавливаю проверенный пакет. Запущенные приложения не закрываются принудительно.'
+            $report.phase = 'Deployment'
+            $report.outcome = Install-VerifiedPackage $packagePath $release $snapshot.windowsVersion
+            $report.phase = 'RegistrationCheck'
+            if ($report.outcome -ne 'PendingRegistration' -or $NoPause -or $attempt -ge 3) { break }
+            Write-Step 'ChatGPT was opened again before Windows finished the update.' 'ChatGPT снова открыли до завершения обновления.' Yellow
+        }
         if ($report.outcome -eq 'PendingRegistration') {
-            Write-Step 'Windows accepted the update. Close ChatGPT completely and reopen it, then run this tool again to verify the installed version.' 'Windows приняла обновление. Полностью закройте ChatGPT и откройте снова, затем запустите скрипт ещё раз для проверки установленной версии.' Yellow
+            Write-Step 'Windows prepared the update, but ChatGPT was still open. Close ChatGPT completely and run Start.cmd again. Reopening ChatGPT alone cannot finish this update: its Windows service needs administrator rights.' 'Windows подготовила обновление, но ChatGPT ещё был открыт. Полностью закройте ChatGPT и снова запустите Start.cmd. Простой перезапуск ChatGPT не завершит обновление: для его службы Windows нужны права администратора.' Yellow
             return 10
         }
         Write-Step 'The new installed version has been verified. Open ChatGPT normally.' 'Новая установленная версия проверена. Откройте ChatGPT обычным способом.' Green
@@ -626,10 +785,13 @@ function Invoke-ChatGPTInstaller {
         $report.outcome = 'Failed'
         $code = Get-ExceptionCode $_
         $network = Get-NetworkException $_
-        $safeCustom = @('FEED_FORMAT_CHANGED', 'FEED_IDENTITY_MISMATCH', 'FEED_VERSION_INVALID', 'FEED_TOO_LARGE', 'UNTRUSTED_URL', 'UNEXPECTED_HTTP_STATUS', 'RELEASE_UNAVAILABLE', 'PACKAGE_SIGNATURE_INVALID', 'PACKAGE_IDENTITY_MISMATCH', 'PACKAGE_VERSION_MISMATCH', 'PACKAGE_SIZE_INVALID', 'MANIFEST_INVALID', 'DOWNLOAD_INCOMPLETE', 'DOWNLOAD_LIMIT_EXCEEDED', 'ANOTHER_INSTANCE', 'PACKAGE_STATUS_CHANGED')
-        if ($_.Exception.Message -in $safeCustom) {
+        $safeCustom = @('FEED_FORMAT_CHANGED', 'FEED_IDENTITY_MISMATCH', 'FEED_VERSION_INVALID', 'FEED_TOO_LARGE', 'UNTRUSTED_URL', 'UNEXPECTED_HTTP_STATUS', 'RELEASE_UNAVAILABLE', 'PACKAGE_SIGNATURE_INVALID', 'PACKAGE_IDENTITY_MISMATCH', 'PACKAGE_VERSION_MISMATCH', 'PACKAGE_SIZE_INVALID', 'MANIFEST_INVALID', 'DOWNLOAD_INCOMPLETE', 'DOWNLOAD_LIMIT_EXCEEDED', 'DOWNLOAD_RANGE_INVALID', 'PACKAGE_STATUS_CHANGED')
+        if ($_.Exception.Message -eq 'ANOTHER_INSTANCE') {
+            $code = 'ANOTHER_INSTANCE'
+            $report.findings += New-Finding $code 'error' (Get-Text 'Another copy of this tool is already running.' 'Скрипт уже запущен в другом окне.') (Get-Text 'Let the other window finish, including an Administrator window that may be waiting for ChatGPT to close, then run the tool again.' 'Дождитесь завершения другого окна, в том числе окна «Администратор», которое может ждать закрытия ChatGPT, затем запустите скрипт снова.')
+        } elseif ($_.Exception.Message -in $safeCustom) {
             $code = $_.Exception.Message
-            $report.findings += New-Finding $code 'error' (Get-Text 'A required integrity or workflow check did not pass.' 'Не пройдена обязательная проверка целостности или выполнения.') (Get-Text 'Use the latest release of this tool and check the official installer. For ANOTHER_INSTANCE, let the other copy finish. Signature checks and source checks are never bypassed.' 'Используйте свежую версию скрипта и проверьте официальный установщик. При ANOTHER_INSTANCE дождитесь другой копии. Проверки подписи и источника не обходятся.')
+            $report.findings += New-Finding $code 'error' (Get-Text 'A required integrity or workflow check did not pass.' 'Не пройдена обязательная проверка целостности или выполнения.') (Get-Text 'Use the latest release of this tool and check the official installer. Signature checks and source checks are never bypassed.' 'Используйте свежую версию скрипта и проверьте официальный установщик. Проверки подписи и источника не обходятся.')
         } elseif ($network) {
             $networkCode = switch ($network.Status) {
                 'NameResolutionFailure' { '0x80072EE7' }
@@ -646,13 +808,17 @@ function Invoke-ChatGPTInstaller {
                 $code = $networkCode
                 $report.findings += Get-ErrorAdvice $code
             }
+        } elseif (Test-TransientNetworkFailure $_) {
+            # The connection dropped during the download, even after resuming.
+            $code = '0x80072EFD'
+            $report.findings += Get-ErrorAdvice $code
         } else { $report.findings += Get-ErrorAdvice $code }
         Write-Step ('Stopped: ' + $code + '. See the diagnostic report below.') ('Остановлено: ' + $code + '. Подробности в отчёте ниже.') Red
         return 1
     }
     finally {
         if ($locked) { $mutex.ReleaseMutex() }
-        $mutex.Dispose()
+        if ($mutex) { $mutex.Dispose() }
         if ($reportNeeded) {
             try { $finalPackage = Get-InstalledPackage; if ($finalPackage) { $report.installedVersionAfter = [string]$finalPackage.Version } } catch { }
             foreach ($finding in $report.findings | Where-Object severity -in @('blocker', 'error', 'warning')) {
@@ -666,11 +832,11 @@ function Invoke-ChatGPTInstaller {
         }
         # No recursive deletion. Only this run's single downloaded file is removed.
         if ($runDirectory -and ($Mode -ne 'Download' -or $report.outcome -ne 'DownloadedAndVerified')) {
-            $allowedRoot = [IO.Path]::GetFullPath((Join-Path $dataRoot 'cache')) + [IO.Path]::DirectorySeparatorChar
+            $allowedRoot = [IO.Path]::GetFullPath($runRoot) + [IO.Path]::DirectorySeparatorChar
             $resolved = [IO.Path]::GetFullPath($runDirectory)
             if ($resolved.StartsWith($allowedRoot, [StringComparison]::OrdinalIgnoreCase)) {
-                if (Test-Path -LiteralPath $packagePath) { Remove-Item -LiteralPath $packagePath -Force -ErrorAction SilentlyContinue }
-                Remove-Item -LiteralPath $runDirectory -ErrorAction SilentlyContinue
+                $null = Remove-InstallerFile $packagePath
+                Remove-EmptyDirectory $resolved
             }
         }
     }

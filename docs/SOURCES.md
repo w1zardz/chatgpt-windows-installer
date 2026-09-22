@@ -1,6 +1,6 @@
 # Official sources and release contract
 
-Reviewed: 2026-09-22. These endpoints and signing details can change independently of this project.
+Reviewed: 2026-09-23. These endpoints and signing details can change independently of this project.
 
 | Purpose | Source |
 | --- | --- |
@@ -33,6 +33,10 @@ The documented download may lag behind or be ahead of the feed. After Windows va
 
 On 2026-09-22, the feed advertised `26.917.6896.0` while its version-specific x64 URL returned HTTP 404. Version 1.0.0 stopped with a generic .NET wrapper error. Version 1.0.1 adds the documented fallback and recognizes nested network exceptions so reports retain HTTP status and transient failures can be retried.
 
+An interrupted download resumes with an HTTP range request that carries `If-Range` with the first response's strong `ETag` (or `Last-Modified`). The partial file is reused only for the same URL within the same run, and the reply must be `206` with exactly the expected `Content-Range`; a `200` reply replaces the partial file. On 2026-09-23 the production host answered range requests with `206`, honored `If-Range` with both validators, and returned the full file (`200`) for a stale `ETag`.
+
 The main installation command is current-user `Add-AppxPackage` with deferred registration. It intentionally does not perform all-user provisioning or install an offline license; follow the official deployment guide when that scope is required.
+
+Deferred registration alone cannot complete an update of this package. On 2026-09-23 (version 1.0.2, Windows 11 x64), `26.917.6896.0` was deferred while ChatGPT ran. When the app was restarted, Windows attempted `RegisterByPackageFamilyName` without administrator rights and failed seven times with `0x80073D28` ("Administrator privileges required to install packaged service"). A second elevated `Add-AppxPackage` with the app closed registered the already staged package in under a second. Since version 1.0.3, interactive runs therefore wait in the Administrator window until ChatGPT is closed and install then; `-NoPause` runs and repeated reopening still end with exit code `10`.
 
 The package handed to AppX is a verified copy in a newly created protected `%ProgramData%` directory. On the validation machine, deployment from the user-profile cache failed with `0x80073CF0` / `0x80070003`, while the identical signed package in ProgramData was accepted for deferred registration. This is an observed path-dependent failure, not proof of a particular underlying Windows defect. The tool does not modify permissions on existing directories.

@@ -7,11 +7,14 @@ Run `Diagnose.cmd` first if you want a report without installation. The full bil
 | Symptom / representative code | Tool behavior | What may still need your action |
 | --- | --- | --- |
 | `0x80073D28`, packaged service requires admin | Requests UAC before installation | Approve as the same Windows user, or ask IT for deployment |
-| `0x80073D02`, app is in use | Uses deferred registration | Fully close and reopen ChatGPT, then verify again |
+| `0x80073D28` each time ChatGPT starts after an update was deferred | Avoided: the Administrator window waits until ChatGPT is closed and installs then, instead of leaving registration to the next app start (which runs without administrator rights) | If you postponed, close ChatGPT and run `Start.cmd` again |
+| `0x80073D02`, app is in use | Asks you to quit ChatGPT and waits; nothing is force-closed | Quit ChatGPT, including its icon near the clock, and do not reopen it until the tool reports completion |
+| Administrator window closes at once, exit code `3` | Reports that the elevated copy could not start the script | Extract the ZIP to a local folder (not a network drive) and run `Start.cmd` again |
+| `ANOTHER_INSTANCE` | Stops the second window | Let the other window finish, including an Administrator window waiting for ChatGPT to close |
 | `0x80073D06`, newer version installed | Keeps the newer version | None; no downgrade is attempted |
 | AppX cannot open a verified file in the user-profile cache | Installs a reverified copy from a new protected ProgramData directory | If Windows still refuses it, preserve the report; no existing permissions are reset |
 | Store app unavailable or Store delivery fails | Uses the official direct MSIX route | Windows deployment policies and dependencies still apply |
-| Connection interrupted | Retries a transient transport failure once | Fix the network if retry fails |
+| Connection interrupted | Resumes the partial download up to four times; `If-Range` restarts it if the file changed on the server | Fix the network if all retries fail |
 | `0x80073CF4`, `0x80070070`, low storage | Checks space and stops | Free space on the Windows/download drive |
 | `0x80073CF3`, dependency conflict | Checks required installed frameworks | Use the official Store installer or IT-provided dependencies |
 | `0x80073CFD`, old Windows | Checks OS and manifest requirements | Install applicable Windows updates |

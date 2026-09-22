@@ -14,11 +14,11 @@ Independent community project. Not made by, sponsored by, or affiliated with Ope
 
 1. Download the ZIP above and **extract the entire folder**.
 2. Double-click **`Start.cmd`**.
-3. Approve the Windows administrator prompt if installation is needed.
+3. Approve the Windows administrator prompt if installation is needed. Installation continues in a separate **Administrator** window; the first window closes when it finishes.
 
 The script detects x64 / ARM64, checks the latest public release, downloads the official package and verifies its Windows signature, signing identity, package identity, version and Windows requirements before installation. Run the same launcher whenever you want to check for another update. An already current or newer installation is left alone.
 
-If ChatGPT is running, Windows can defer registration. **Save work, fully close ChatGPT, reopen it, then run the launcher again to confirm the installed version.** “Pending registration” is reported separately from verified installation.
+If ChatGPT is open, the Administrator window asks you to **save your work and quit ChatGPT completely, including its icon near the clock**, then installs as soon as it closes. Nothing is closed by force. Do not rely on simply reopening ChatGPT to finish a deferred update: the package contains a Windows service, and Windows retries a deferred registration at the next app start without administrator rights, which fails with `0x80073D28`. To postpone, close the Administrator window and run `Start.cmd` again later with ChatGPT closed. “Pending registration” is reported separately from verified installation.
 
 The Windows consent prompt and managed-device permissions cannot be made into zero-click steps. Read the scripts before running them with administrator privileges.
 
@@ -28,9 +28,10 @@ The Windows consent prompt and managed-device permissions cannot be made into ze
 - Resolves the latest version on each run, instead of keeping an obsolete download URL in a script.
 - Installs or updates directly from OpenAI's distribution server, without requiring you to browse Microsoft Store.
 - Requests administrator permission for installation of packaged services, the cause of **`0x80073D28`**.
-- Retries a transient interrupted connection once and downloads into a new run folder.
+- Resumes an interrupted download from where it stopped (up to four retries); `If-Range` makes the server resend the whole file if it changed meanwhile.
 - Verifies the downloaded package and refuses unexpected publishers, versions or architectures.
-- Preserves newer installations and defers registration when the app is in use.
+- Preserves newer installations and waits for you to close ChatGPT instead of leaving the update to a registration that cannot finish without administrator rights.
+- Removes package files left behind by an interrupted earlier run and keeps only the latest 20 reports.
 - Produces local text and JSON diagnostics with an error catalog, suggested next steps and recent relevant deployment codes.
 
 It detects or explains additional failures involving dependencies, disk space, unsupported Windows versions, disabled services, policies, certificates, DNS/TLS, package conflicts and pending restarts. Some need an administrator, Windows repair, a supported region, or an upstream fix. See the [coverage and limitations](docs/TROUBLESHOOTING.md).
@@ -80,13 +81,13 @@ A manual installation does **not** inherently turn off the app's built-in update
 - Internet access to `persistent.oaistatic.com` for normal operation; enough disk space for download and extraction.
 - Administrator approval when installing. Elevation under a **different account** stops rather than installing for the wrong user.
 
-Reports are stored in `%LOCALAPPDATA%\ChatGPTWindowsInstaller\reports`. Verified downloads from `-Mode Download` remain in the tool's own `cache` folder. Automatic mode deletes only its own downloaded file after use.
+Reports are stored in `%LOCALAPPDATA%\ChatGPTWindowsInstaller\reports`; the latest 20 runs are kept. Verified downloads from `-Mode Download` remain in the tool's own `downloads` folder. Automatic mode deletes only its own downloaded file after use. If a run was interrupted, the next installing run removes its leftover package file once it is a day old: only files named `ChatGPT-x64.msix` / `ChatGPT-arm64.msix` in the tool's own run folders, never recursively.
 
 For installation, the verified package is copied into a new protected directory under `%ProgramData%`, where Windows' deployment service can access it. Only administrators and SYSTEM receive write access; the current user receives read access. The exact copy is verified again before installation, then only that temporary file and its directory are removed. Existing folder permissions and application data are not changed.
 
 No report is uploaded. Reports include Windows/app versions, Windows home region, selected service/policy states and relevant error codes. They exclude raw event messages, usernames, computer names, SIDs, account credentials, proxy URLs and chats. Review any report before sharing it. See [security and privacy](SECURITY.md).
 
-Exit codes: **0** completed/current; **1** failed; **2** user/administrator action required; **10** Windows accepted the update, registration still needs verification after closing the app.
+Exit codes: **0** completed/current; **1** failed; **2** user/administrator action required; **3** the Administrator window could not start the tool (for example, the folder is on a network drive or was moved); **10** Windows prepared the update, but ChatGPT stayed open, so close it and run the tool again.
 
 ## Trust, sources and maintenance
 
@@ -107,6 +108,6 @@ Package binaries are not hosted in this repository. The GitHub release ZIP conta
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1
 ```
 
-Tests cover source validation, malformed manifests/feed data, package identity, architecture, version decisions, signature rejection, permission handoff, deferred updates, policy failures, privacy and installation side-effect boundaries. They mock Windows package installation; they do not install ChatGPT on your computer. CI runs on Windows with both Windows PowerShell and PowerShell 7.
+Tests cover source validation, malformed manifests/feed data, package identity, architecture, version decisions, signature rejection, permission handoff, waiting for ChatGPT to close, resumed downloads, leftover cleanup, policy failures, privacy and installation side-effect boundaries. They mock Windows package installation; they do not install ChatGPT on your computer. CI runs on Windows with both Windows PowerShell and PowerShell 7.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). MIT licensed. ChatGPT, Codex, OpenAI, Windows and Microsoft Store are names belonging to their respective owners.

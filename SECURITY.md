@@ -8,7 +8,9 @@ This is a community installer wrapper, not an OpenAI or Microsoft product. Inspe
 - Windows signature/chain validation plus a pinned publisher subject and manifest identity.
 - Fresh verification immediately before the package-installation call.
 - Installation uses a reverified copy in an atomically created ProgramData directory with protected permissions. Administrators and SYSTEM can write; the current user can read. Existing directory permissions are not changed.
-- No `Invoke-Expression`, downloaded script execution, signature bypass, downgrade flag, process killing, app-data reset, registry repair or blanket AppX re-registration.
+- No `Invoke-Expression`, downloaded script execution, signature bypass, downgrade flag, process killing, app-data reset, registry repair or blanket AppX re-registration. When ChatGPT is open, the tool waits for the user to close it.
+- The elevated command line escapes the script path for every PowerShell quote character, including typographic apostrophes, and reports exit code 3 instead of success when the script cannot start.
+- Cleanup deletes only files named `ChatGPT-x64.msix` / `ChatGPT-arm64.msix` in the tool's own run folders: 32-hex-digit folders in its cache, and `ChatGPTWindowsInstaller-*` folders in ProgramData owned by Administrators. Leftovers are removed only after a day, never recursively and never through links. Only the newest 20 report pairs are kept.
 - No antivirus, SmartScreen, firewall, execution-policy persistence, country, proxy or corporate-policy changes.
 - Administrator consent through Windows UAC; no stored passwords or elevation bypass.
 - Current-user deployment only. A UAC handoff to a different account is rejected.
