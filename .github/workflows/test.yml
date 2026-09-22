@@ -15,6 +15,11 @@ jobs:
     name: Windows / ${{ matrix.shell }}
     steps:
       - uses: actions/checkout@v4
-      - name: Test without installing applications
-        shell: ${{ matrix.shell }}
+      - name: Test in Windows PowerShell
+        if: matrix.shell == 'powershell'
+        shell: powershell
+        run: ./tests/Run-Tests.ps1
+      - name: Test in PowerShell 7
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
         run: ./tests/Run-Tests.ps1
