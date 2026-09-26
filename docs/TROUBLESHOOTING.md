@@ -8,7 +8,8 @@ Run `Diagnose.cmd` first if you want a report without installation. The full bil
 | --- | --- | --- |
 | `0x80073D28`, packaged service requires admin | Requests UAC before installation | Approve as the same Windows user, or ask IT for deployment |
 | `0x80073D28` each time ChatGPT starts after an update was deferred | Avoided: the Administrator window waits until ChatGPT is closed and installs then, instead of leaving registration to the next app start (which runs without administrator rights) | If you postponed, close ChatGPT and run `Start.cmd` again |
-| `0x80073D02`, app is in use | Asks you to quit ChatGPT and waits; nothing is force-closed | Quit ChatGPT, including its icon near the clock, and do not reopen it until the tool reports completion |
+| `0x80073D02`, app is in use | Offers target-app shutdown with explicit permission, manual exit, or postponement | Save work, run `Start.cmd`, choose 1 and wait for the registered version check |
+| `PendingRegistration` / `REGISTRATION_PENDING`, including after three attempts in 1.0.3 | 1.0.4 stops after one unverified deployment, reports both versions and never claims the app was reopened | Save work, run the latest `Start.cmd`, choose 1. If already chosen, restart Windows and retry before opening ChatGPT; inspect deployment events if it persists |
 | Administrator window closes at once, exit code `3` | Reports that the elevated copy could not start the script | Extract the ZIP to a local folder (not a network drive) and run `Start.cmd` again |
 | `ANOTHER_INSTANCE` | Stops the second window | Let the other window finish, including an Administrator window waiting for ChatGPT to close |
 | `0x80073D06`, newer version installed | Keeps the newer version | None; no downgrade is attempted |

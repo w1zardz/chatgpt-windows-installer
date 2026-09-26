@@ -5,7 +5,7 @@ Diagnose, install, or update the official ChatGPT desktop app for Windows.
 .DESCRIPTION
 Double-click Start.cmd for automatic mode. Diagnose.cmd never installs an app.
 The installer asks Windows for administrator consent when an update is needed.
-If ChatGPT is open, the administrator window waits until it is closed, then installs.
+Before an update, choose target-app shutdown, manual exit, or postponement.
 #>
 [CmdletBinding()]
 param(
@@ -14,6 +14,8 @@ param(
     [switch]$Offline,
     # Non-interactive: no final pause and no waiting for ChatGPT to close.
     [switch]$NoPause,
+    # Explicit permission for Windows to close processes belonging to the target package.
+    [switch]$CloseRunningApp,
     # Internal UAC handoff: never install into a different administrator account.
     [string]$CallerSid
 )
@@ -23,7 +25,7 @@ $exitCode = 1
 $handoff = [ref]$false
 try {
     Import-Module (Join-Path $PSScriptRoot 'src\Installer.psm1') -Force -ErrorAction Stop
-    $exitCode = Invoke-ChatGPTInstaller -Mode $Mode -Language $Language -Offline:$Offline -CallerSid $CallerSid -NoPause:$NoPause -EntryPath $PSCommandPath -Handoff $handoff
+    $exitCode = Invoke-ChatGPTInstaller -Mode $Mode -Language $Language -Offline:$Offline -CallerSid $CallerSid -NoPause:$NoPause -CloseRunningApp:$CloseRunningApp -EntryPath $PSCommandPath -Handoff $handoff
 }
 catch {
     # Never print unfiltered exceptions: network errors may contain proxy credentials.

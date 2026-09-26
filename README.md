@@ -18,7 +18,9 @@ Independent community project. Not made by, sponsored by, or affiliated with Ope
 
 The script detects x64 / ARM64, checks the latest public release, downloads the official package and verifies its Windows signature, signing identity, package identity, version and Windows requirements before installation. Run the same launcher whenever you want to check for another update. An already current or newer installation is left alone.
 
-If ChatGPT is open, the Administrator window asks you to **save your work and quit ChatGPT completely, including its icon near the clock**, then installs as soon as it closes. Nothing is closed by force. Do not rely on simply reopening ChatGPT to finish a deferred update: the package contains a Windows service, and Windows retries a deferred registration at the next app start without administrator rights, which fails with `0x80073D28`. To postpone, close the Administrator window and run `Start.cmd` again later with ChatGPT closed. “Pending registration” is reported separately from verified installation.
+Before updating, the Administrator window offers **1 — close ChatGPT and update now**, **2 / Enter — close it yourself**, or **3 — postpone**. Save your work in ChatGPT / Codex, including active tasks, before choosing 1: Windows may forcibly close all processes belonging to this package. Option 2 waits for you to quit the app, including its tray icon. Option 3 exits without deploying. Installation is successful only after the registered version is verified.
+
+Reopening ChatGPT alone may not finish a deferred update: registration of its packaged Windows service can fail without administrator rights (`0x80073D28`). If Windows leaves the older version registered, the tool reports **Update NOT completed**, shows both versions and stops. It does not assume you reopened the app or repeat the same deployment three times.
 
 The Windows consent prompt and managed-device permissions cannot be made into zero-click steps. Read the scripts before running them with administrator privileges.
 
@@ -30,7 +32,7 @@ The Windows consent prompt and managed-device permissions cannot be made into ze
 - Requests administrator permission for installation of packaged services, the cause of **`0x80073D28`**.
 - Resumes an interrupted download from where it stopped (up to four retries); `If-Range` makes the server resend the whole file if it changed meanwhile.
 - Verifies the downloaded package and refuses unexpected publishers, versions or architectures.
-- Preserves newer installations and waits for you to close ChatGPT instead of leaving the update to a registration that cannot finish without administrator rights.
+- Preserves newer installations; lets you authorize Windows to close the target app, close it manually, or postpone.
 - Removes package files left behind by an interrupted earlier run and keeps only the latest 20 reports.
 - Produces local text and JSON diagnostics with an error catalog, suggested next steps and recent relevant deployment codes.
 
@@ -58,7 +60,13 @@ Advanced commands, from **Windows PowerShell** in the extracted folder:
 
 # Download and verify the package without installing it
 .\Install-ChatGPT.ps1 -Mode Download
+
+# Explicitly allow Windows to close ChatGPT / Codex processes after verification.
+# Save work and finish active tasks first. This permission is forwarded through UAC.
+.\Install-ChatGPT.ps1 -CloseRunningApp
 ```
+
+`-NoPause` skips the choice and manual wait; it never grants permission to close an app. Use `-NoPause -CloseRunningApp` only when closure is intended. Diagnose and Download modes never close applications, even if that switch is supplied.
 
 If local script policy blocks these commands, use `Start.cmd` / `Diagnose.cmd`. The launcher sets execution policy only for its own PowerShell process. It does not change the machine's policy or override an organization's Group Policy.
 
@@ -87,7 +95,7 @@ For installation, the verified package is copied into a new protected directory 
 
 No report is uploaded. Reports include Windows/app versions, Windows home region, selected service/policy states and relevant error codes. They exclude raw event messages, usernames, computer names, SIDs, account credentials, proxy URLs and chats. Review any report before sharing it. See [security and privacy](SECURITY.md).
 
-Exit codes: **0** completed/current; **1** failed; **2** user/administrator action required; **3** the Administrator window could not start the tool (for example, the folder is on a network drive or was moved); **10** Windows prepared the update, but ChatGPT stayed open, so close it and run the tool again.
+Exit codes: **0** completed/current; **1** failed; **2** postponed or user/administrator action required; **3** the Administrator window could not start the tool (for example, the folder is on a network drive or was moved); **10** the new registered version is unverified and the update is not complete.
 
 ## Trust, sources and maintenance
 

@@ -198,6 +198,9 @@ try {
         $handoffCode = & $module { param($Entry) Start-ElevatedInstaller -EntryPath $Entry -Language en -CallerSid 'S-1-5-21-1-1001' -NoPause } $handoffFixture
         Assert-Equal $handoffCode $code ('Preserve exit code through encoded handoff: ' + $code)
     }
+    ('param($Mode,$Language,$CallerSid,[switch]$NoPause,[switch]$CloseRunningApp)' + [Environment]::NewLine + 'if ($CloseRunningApp -and $NoPause) { exit 10 }; exit 1') | Set-Content -LiteralPath $handoffFixture -Encoding UTF8
+    $handoffCode = & $module { param($Entry) Start-ElevatedInstaller -EntryPath $Entry -Language en -CallerSid 'S-1-5-21-1-1001' -NoPause -CloseRunningApp } $handoffFixture
+    Assert-Equal $handoffCode 10 'Explicit close permission survives real encoded UAC handoff'
     # A script the administrator window cannot start (moved folder, unmapped drive) is not a success.
     $missingCode = & $module { param($Entry) Start-ElevatedInstaller -EntryPath $Entry -Language en -CallerSid 'S-1-5-21-1-1001' -NoPause } (Join-Path $tempRoot 'moved folder\Install-ChatGPT.ps1')
     Assert-Equal $missingCode 3 'Unstartable elevated script returns 3'
@@ -215,8 +218,8 @@ try {
     # Full workflow simulations. All package mutations and elevation are mocked.
     $env:LOCALAPPDATA = $tempRoot
     $env:ProgramData = $tempRoot
-    $interactiveScenarios = @('WaitForAppExit','ReopenedDuringInstall','StillOpen')
-    foreach ($scenario in @('Current','Update','Pending','SignatureFailure','DownloadFailure','ChangedAccount','Offline','MissingDependency','Elevation','ElevationStartFailure','ElevationClosed','PolicyFailure','UnknownFailure','FallbackOlder','FallbackNoDowngrade','FallbackSignatureFailure','Http404','Http403','WrappedTimeout','TransientTimeout','SocketDrop','SocketDropRepeated') + $interactiveScenarios) {
+    $interactiveScenarios = @('WaitForAppExit','ReopenedDuringInstall','StillOpen','ChooseClose','Postpone')
+    foreach ($scenario in @('Current','Update','Pending','SignatureFailure','DownloadFailure','ChangedAccount','Offline','MissingDependency','Elevation','ElevationStartFailure','ElevationClosed','PolicyFailure','UnknownFailure','FallbackOlder','FallbackNoDowngrade','FallbackSignatureFailure','Http404','Http403','WrappedTimeout','TransientTimeout','SocketDrop','SocketDropRepeated','CloseExplicit','CloseStillPending','ClosePolicyFailure','ElevationClose','CloseDiagnose','CloseDownload','CloseSignatureFailure','CloseStageSignatureFailure','CloseCurrent') + $interactiveScenarios) {
         Remove-Module Installer -Force
         $module = Import-Module $modulePath -Force -DisableNameChecking -PassThru
         & $module {
@@ -224,9 +227,17 @@ try {
             $script:Scenario = $Scenario
             $script:MutexName = 'Local\ChatGPTWindowsInstaller.Tests.' + $PID
             $script:InstallCalls = 0; $script:DownloadCalls = 0; $script:FeedCalls = 0; $script:ElevationCalls = 0; $script:ProcessPolls = 0
+            $script:VerificationCalls = 0
             function script:Get-CurrentUserSid { 'S-1-5-21-1-1001' }
             function script:Test-IsAdministrator { $script:Scenario -notlike 'Elevation*' }
             function script:Start-Sleep { param($Seconds) }
+            function script:Read-Host {
+                param($Prompt)
+                if ($script:Scenario -eq 'ChooseClose') { return '1' }
+                if ($script:Scenario -eq 'Postpone') { return '3' }
+                if ($script:Scenario -in @('WaitForAppExit','ReopenedDuringInstall','StillOpen')) { return '2' }
+                throw 'Noninteractive runs must never prompt for closing the app'
+            }
             function script:Get-RunningAppProcess {
                 $script:ProcessPolls++
                 # WaitForAppExit: open for two polls. ReopenedDuringInstall: reopened after the first install.
@@ -249,9 +260,9 @@ try {
             }
             function script:Get-InstalledPackage {
                 # Registration completes on the first install unless ChatGPT stayed open (deferred).
-                $registered = $script:InstallCalls -gt 0 -and $script:Scenario -notin @('Pending','StillOpen')
+                $registered = $script:InstallCalls -gt 0 -and $script:Scenario -notin @('Pending','StillOpen','CloseStillPending')
                 if ($script:Scenario -eq 'ReopenedDuringInstall') { $registered = $script:InstallCalls -ge 2 }
-                $version = if ($script:Scenario -in @('Current','FallbackNoDowngrade') -or $registered) { '26.915.4065.0' } else { '26.903.8094.0' }
+                $version = if ($script:Scenario -in @('Current','CloseCurrent','FallbackNoDowngrade') -or $registered) { '26.915.4065.0' } else { '26.903.8094.0' }
                 if ($script:Scenario -eq 'FallbackNoDowngrade') { $version = '26.912.1.0' }
                 if ($script:Scenario -eq 'FallbackOlder' -and $script:InstallCalls -gt 0) { $version = '26.910.1.0' }
                 [pscustomobject]@{Version=$version;Status='Ok'}
@@ -270,7 +281,9 @@ try {
             }
             function script:Confirm-OfficialPackage {
                 param($Path,$Release,$WindowsVersion,[switch]$AllowVersionDifference)
-                if ($script:Scenario -in @('SignatureFailure','FallbackSignatureFailure')) { throw 'PACKAGE_SIGNATURE_INVALID' }
+                $script:VerificationCalls++
+                if ($script:Scenario -eq 'CloseStageSignatureFailure' -and $script:VerificationCalls -eq 3) { throw 'PACKAGE_SIGNATURE_INVALID' }
+                if ($script:Scenario -in @('SignatureFailure','FallbackSignatureFailure','CloseSignatureFailure')) { throw 'PACKAGE_SIGNATURE_INVALID' }
                 $version = if ($script:Scenario -in @('FallbackOlder','FallbackNoDowngrade')) { '26.910.1.0' } else { $Release.Version }
                 if (-not $AllowVersionDifference -and $Release.Version -ne $version) { throw 'PACKAGE_VERSION_MISMATCH' }
                 [pscustomobject]@{Metadata=[pscustomobject]@{Dependencies=@();Version=$version};Sha256=('A'*64);SignatureStatus='Valid'}
@@ -280,16 +293,18 @@ try {
                 if ($script:Scenario -eq 'MissingDependency') { New-Finding 'DEPENDENCY_MISSING' 'blocker' 'Missing' 'Use official installer.' }
             }
             function script:Add-AppxPackage {
-                [CmdletBinding()]param($Path,[switch]$DeferRegistrationWhenPackagesAreInUse)
+                [CmdletBinding()]param($Path,[switch]$DeferRegistrationWhenPackagesAreInUse,[switch]$ForceTargetApplicationShutdown)
                 $script:InstallCalls++
-                if (-not $DeferRegistrationWhenPackagesAreInUse) { throw 'Test requires deferred registration' }
+                $expectedForce = $script:Scenario -in @('CloseExplicit','CloseStillPending','ClosePolicyFailure','ChooseClose')
+                if ([bool]$ForceTargetApplicationShutdown -ne $expectedForce -or [bool]$DeferRegistrationWhenPackagesAreInUse -eq $expectedForce) { throw 'Close permission must select only target shutdown; otherwise defer' }
                 if ($Path -notmatch 'ChatGPTWindowsInstaller-[a-f0-9]{32}[\\/]ChatGPT-x64\.msix$' -or -not (Test-Path -LiteralPath $Path)) { throw 'Windows must receive the existing staged copy' }
-                if ($script:Scenario -eq 'PolicyFailure') { throw '0x80073D01' }
+                if ($script:Scenario -in @('PolicyFailure','ClosePolicyFailure')) { throw '0x80073D01' }
                 if ($script:Scenario -eq 'UnknownFailure') { throw 'Private C:\Users\SecretName\data token=private 0xDEADBEEF' }
             }
             function script:Start-ElevatedInstaller {
-                param($EntryPath,$Language,$CallerSid,[switch]$NoPause)
+                param($EntryPath,$Language,$CallerSid,[switch]$NoPause,[switch]$CloseRunningApp)
                 $script:ElevationCalls++
+                if ([bool]$CloseRunningApp -ne ($script:Scenario -eq 'ElevationClose')) { throw 'Wrong close permission forwarded to UAC' }
                 if ($script:Scenario -eq 'ElevationStartFailure') { return 3 }
                 if ($script:Scenario -eq 'ElevationClosed') { return -1073741510 }
                 return 10
@@ -299,6 +314,9 @@ try {
         $params = @{ Mode='Auto'; Language='en'; NoPause=($scenario -notin $interactiveScenarios); EntryPath=(Join-Path $root 'Install-ChatGPT.ps1'); Handoff=$handoffResult }
         if ($scenario -eq 'ChangedAccount') { $params.CallerSid='S-1-5-21-2-1002' }
         if ($scenario -eq 'Offline') { $params.Mode='Diagnose'; $params.Offline=$true }
+        if ($scenario -like 'Close*' -or $scenario -eq 'ElevationClose') { $params.CloseRunningApp=$true }
+        if ($scenario -eq 'CloseDiagnose') { $params.Mode='Diagnose' }
+        if ($scenario -eq 'CloseDownload') { $params.Mode='Download' }
         $result = Invoke-ChatGPTInstaller @params 6>$null
         $counts = & $module { @($script:InstallCalls, $script:DownloadCalls, $script:FeedCalls, $script:ElevationCalls, $script:ProcessPolls) }
         # Exit status, installs, downloads, feed checks, elevations, ChatGPT process checks.
@@ -325,14 +343,34 @@ try {
             'TransientTimeout' { @(0,1,2,1,0,0) }
             'SocketDrop' { @(0,1,2,1,0,0) }
             'SocketDropRepeated' { @(1,0,5,1,0,0) }
+            'CloseExplicit' { @(0,1,1,1,0,0) }
+            'CloseStillPending' { @(10,1,1,1,0,0) }
+            'ClosePolicyFailure' { @(1,1,1,1,0,0) }
+            'CloseSignatureFailure' { @(1,0,1,1,0,0) }
+            'CloseStageSignatureFailure' { @(1,0,1,1,0,0) }
+            'CloseDiagnose' { @(0,0,0,1,0,0) }
+            'CloseDownload' { @(0,0,1,1,0,0) }
+            'CloseCurrent' { @(0,0,0,1,0,0) }
+            'ElevationClose' { @(10,0,0,1,1,0) }
+            'ChooseClose' { @(0,1,1,1,0,0) }
+            'Postpone' { @(2,0,1,1,0,0) }
             'WaitForAppExit' { @(0,1,1,1,0,3) }
-            'ReopenedDuringInstall' { @(0,2,1,1,0,3) }
-            'StillOpen' { @(10,3,1,1,0,3) }
+            'ReopenedDuringInstall' { @(10,1,1,1,0,1) }
+            'StillOpen' { @(10,1,1,1,0,1) }
         }
         Assert-Equal $result $expected[0] ($scenario + ' exit status')
         for ($i=0; $i -lt 5; $i++) { Assert-Equal $counts[$i] $expected[$i+1] ($scenario + ' side effects ' + $i) }
         # Only a completed handoff suppresses the launcher's pause; failures must stay visible.
-        Assert-Equal $handoffResult.Value ($scenario -eq 'Elevation') ($scenario + ' handoff')
+        Assert-Equal $handoffResult.Value ($scenario -in @('Elevation','ElevationClose')) ($scenario + ' handoff')
+        if ($scenario -in @('Pending','StillOpen','CloseStillPending','ChooseClose','Postpone','CloseExplicit')) {
+            $latestReport = Get-ChildItem -LiteralPath (Join-Path $tempRoot 'ChatGPTWindowsInstaller\reports') -Filter '*.json' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            $report = Get-Content -LiteralPath $latestReport.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+            Assert-Equal $report.closeRunningApp ($scenario -in @('CloseStillPending','ChooseClose','CloseExplicit')) ($scenario + ' records actual shutdown permission')
+            if ($result -eq 10) {
+                Assert-Equal ('REGISTRATION_PENDING' -in $report.findings.code) $true 'Unverified registration has an actionable finding'
+                Assert-Equal $report.installedVersionAfter '26.903.8094.0' 'Pending report preserves the actual old version'
+            }
+        }
         if ($scenario -in @('FallbackOlder','FallbackNoDowngrade','Http404','Http403','WrappedTimeout','SocketDropRepeated','ElevationStartFailure','ElevationClosed')) {
             $latestReport = Get-ChildItem -LiteralPath (Join-Path $tempRoot 'ChatGPTWindowsInstaller\reports') -Filter '*.json' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
             $report = Get-Content -LiteralPath $latestReport.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -450,6 +488,19 @@ try {
     $timer = [Diagnostics.Stopwatch]::StartNew()
     $null = & $module { @(Get-RunningAppProcess).Count }
     Assert-Equal ($timer.Elapsed.TotalSeconds -lt 10) $true 'ChatGPT process check completes'
+    foreach ($case in @(
+        @('OpenAI.Codex_2p2nqsd0c76g0', '', $true),
+        @('Other.Package_publisher', 'C:\Program Files\WindowsApps\OpenAI.Codex_1.0.0.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe', $false),
+        @('', 'D:\WindowsApps\OpenAI.Codex_1.0.0.0_arm64__2p2nqsd0c76g0\app\helper.exe', $true),
+        @('', 'C:\Downloads\ChatGPT.exe', $false),
+        @('', 'C:\Program Files\WindowsApps\OpenAI.Codex_1.0.0.0_x64__otherpublisher\app\ChatGPT.exe', $false),
+        @('', '', $false)
+    )) {
+        $matched = & $module { param($Family,$Path) Test-TargetProcessIdentity ([pscustomobject]@{FamilyName=$Family;ImagePath=$Path}) } $case[0] $case[1]
+        Assert-Equal $matched $case[2] 'Identify target package without relying on MainModule or process name'
+    }
+    Assert-Equal ([ChatGPTWindowsInstaller.ProcessIdentity]::Read(-1).FamilyName) '' 'Exited or inaccessible process does not crash discovery'
+    Assert-Equal ([ChatGPTWindowsInstaller.ProcessIdentity]::Read($PID).ImagePath -ne '') $true 'Limited-query native API reads the real PowerShell process'
 
     if ($PSVersionTable.PSEdition -eq 'Desktop') {
         # A window started with "Run as administrator" holds a lock a standard window cannot open.

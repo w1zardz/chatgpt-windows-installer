@@ -1,6 +1,6 @@
 ﻿#Requires -Version 5.1
 Set-StrictMode -Version 2.0
-$script:ToolVersion = '1.0.3'
+$script:ToolVersion = '1.0.4'
 $script:PackageIdentity = 'OpenAI.Codex'
 $script:PackagePublisher = 'CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B'
 $script:FeedUri = 'https://persistent.oaistatic.com/codex-app-prod/windows-store-update.json'
@@ -440,12 +440,41 @@ function Get-InstallOutcome {
 }
 
 function Get-RunningAppProcess {
-    # Only this Windows session's ChatGPT processes keep the package in use for this user.
+    # Package identity works even when MainModule cannot be read (e.g. cross-bitness).
+    if (-not ('ChatGPTWindowsInstaller.ProcessIdentity' -as [type])) {
+        Add-Type -Path (Join-Path $PSScriptRoot 'ProcessIdentity.cs') -ErrorAction Stop
+    }
     $session = (Get-Process -Id $PID).SessionId
-    $marker = '\WindowsApps\' + $script:PackageIdentity + '_'
-    return @([Diagnostics.Process]::GetProcesses() | Where-Object { $_.SessionId -eq $session } | Where-Object {
-        try { $_.MainModule.FileName.IndexOf($marker, [StringComparison]::OrdinalIgnoreCase) -ge 0 } catch { $false }
-    })
+    foreach ($process in [Diagnostics.Process]::GetProcesses()) {
+        try {
+            if ($process.SessionId -ne $session) { continue }
+            $identity = [ChatGPTWindowsInstaller.ProcessIdentity]::Read($process.Id)
+            if (Test-TargetProcessIdentity $identity) {
+                [pscustomobject]@{ Id = $process.Id; ProcessName = $process.ProcessName }
+            }
+        } catch { } finally { $process.Dispose() }
+    }
+}
+
+function Test-TargetProcessIdentity {
+    param($Identity)
+    if ($Identity.FamilyName) { return $Identity.FamilyName -eq 'OpenAI.Codex_2p2nqsd0c76g0' }
+    # Helpers may run from the package without a package identity. Never match by process name alone.
+    return $Identity.ImagePath -match '\\WindowsApps\\OpenAI\.Codex_[^\\]+__2p2nqsd0c76g0\\'
+}
+
+function Read-AppCloseChoice {
+    Write-Step 'Save your work in ChatGPT / Codex, including active tasks. Windows can close all processes belonging to this app to finish the update; unsaved work may be lost.' 'Сохраните работу в ChatGPT / Codex, включая активные задачи. Для завершения обновления Windows может закрыть все процессы этого приложения; несохранённая работа может быть потеряна.' Yellow
+    Write-Step '1 - Close ChatGPT and update now. 2 / Enter - I will close it myself. 3 - Postpone.' '1 — Закрыть ChatGPT и обновить сейчас. 2 / Enter — Закрою вручную. 3 — Отложить.'
+    while ($true) {
+        $choice = Read-Host (Get-Text 'Choose 1, 2 or 3' 'Выберите 1, 2 или 3')
+        switch (([string]$choice).Trim()) {
+            '1' { return 'Close' }
+            '2' { return 'Wait' }
+            '' { return 'Wait' }
+            '3' { return 'Postpone' }
+        }
+    }
 }
 
 function Wait-AppExit {
@@ -538,7 +567,7 @@ function Clear-StaleInstallerFiles {
 }
 
 function Install-VerifiedPackage {
-    param([string]$Path, $Release, [string]$WindowsVersion)
+    param([string]$Path, $Release, [string]$WindowsVersion, [switch]$CloseRunningApp)
     # Windows PowerShell draws deployment progress over earlier console lines and can leave them garbled.
     $ProgressPreference = 'SilentlyContinue'
     $null = Confirm-OfficialPackage $Path $Release $WindowsVersion
@@ -550,7 +579,12 @@ function Install-VerifiedPackage {
         Copy-Item -LiteralPath $Path -Destination $stagePath -ErrorAction Stop
         # Verify the exact protected copy that Windows will open.
         $null = Confirm-OfficialPackage $stagePath $Release $WindowsVersion
-        Add-AppxPackage -Path $stagePath -DeferRegistrationWhenPackagesAreInUse -ErrorAction Stop
+        if ($CloseRunningApp) {
+            # Consent applies only to the target app, never to unrelated dependency applications.
+            Add-AppxPackage -Path $stagePath -ForceTargetApplicationShutdown -ErrorAction Stop
+        } else {
+            Add-AppxPackage -Path $stagePath -DeferRegistrationWhenPackagesAreInUse -ErrorAction Stop
+        }
         return Get-InstallOutcome (Get-InstalledPackage) $Release.Version
     } finally {
         if ($stageDirectory) {
@@ -565,7 +599,7 @@ function Install-VerifiedPackage {
 }
 
 function Start-ElevatedInstaller {
-    param([string]$EntryPath, [string]$Language, [string]$CallerSid, [switch]$NoPause)
+    param([string]$EntryPath, [string]$Language, [string]$CallerSid, [switch]$NoPause, [switch]$CloseRunningApp)
     if ($EntryPath.Contains([char]0)) { throw 'ENTRY_PATH_INVALID' }
     # PowerShell also treats typographic quotes such as U+2019 as single quotes; escape all of them.
     $escapedPath = [Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($EntryPath)
@@ -573,6 +607,7 @@ function Start-ElevatedInstaller {
     if ($CallerSid -notmatch '^S-1-5-(\d+-)*\d+$') { throw 'CALLER_SID_INVALID' }
     $invocation = "& '$escapedPath' -Mode Auto -Language '$Language' -CallerSid '$CallerSid'"
     if ($NoPause) { $invocation += ' -NoPause' }
+    if ($CloseRunningApp) { $invocation += ' -CloseRunningApp' }
     # A script that cannot start (moved folder, unmapped network drive) must not look like success:
     # without try/catch the command exits 0. -EncodedCommand otherwise collapses nonzero codes to 1.
     $command = 'try { ' + $invocation + ' } catch { exit 3 }; exit $LASTEXITCODE'
@@ -622,7 +657,7 @@ function Invoke-ChatGPTInstaller {
     param(
         [ValidateSet('Auto', 'Diagnose', 'Download')][string]$Mode = 'Auto',
         [ValidateSet('Auto', 'en', 'ru')][string]$Language = 'Auto',
-        [switch]$Offline, [string]$CallerSid, [switch]$NoPause, [string]$EntryPath, [ref]$Handoff
+        [switch]$Offline, [string]$CallerSid, [switch]$NoPause, [switch]$CloseRunningApp, [string]$EntryPath, [ref]$Handoff
     )
     $script:Language = $Language
     if ($Language -eq 'Auto') { $script:Language = if ((Get-UICulture).TwoLetterISOLanguageName -eq 'ru') { 'ru' } else { 'en' } }
@@ -641,7 +676,7 @@ function Invoke-ChatGPTInstaller {
         toolVersion = $script:ToolVersion; generatedUtc = [DateTime]::UtcNow.ToString('o'); mode = $Mode
         outcome = 'Checking'; system = $null; latestVersion = $null; findings = @(); recentDeploymentErrors = @()
         packageSha256 = $null; signatureStatus = $null; packageVersion = $null
-        packageSource = $null; installedVersionAfter = $null; phase = 'Preflight'
+        packageSource = $null; installedVersionAfter = $null; phase = 'Preflight'; closeRunningApp = $false
     }
     $dataRoot = Join-Path $env:LOCALAPPDATA 'ChatGPTWindowsInstaller'
     $runRoot = $null
@@ -701,7 +736,7 @@ function Invoke-ChatGPTInstaller {
             # Release the per-session lock before starting the elevated copy.
             $mutex.ReleaseMutex(); $locked = $false
             $report.phase = 'Elevation'
-            $result = Start-ElevatedInstaller -EntryPath $EntryPath -Language $script:Language -CallerSid (Get-CurrentUserSid) -NoPause:$NoPause
+            $result = Start-ElevatedInstaller -EntryPath $EntryPath -Language $script:Language -CallerSid (Get-CurrentUserSid) -NoPause:$NoPause -CloseRunningApp:$CloseRunningApp
             if ($result -in @(0, 1, 2, 10)) {
                 # The administrator window has already shown its result and report.
                 $reportNeeded = $false
@@ -763,19 +798,31 @@ function Invoke-ChatGPTInstaller {
             return 0
         }
         if ($decision -eq 'NeedsRepair') { throw 'PACKAGE_STATUS_CHANGED' }
-        # Deferred registration cannot finish this package later (see Wait-AppExit), so interactive runs
-        # wait for ChatGPT to close and install again if it was reopened before Windows finished.
-        for ($attempt = 1; ; $attempt++) {
+        $closeForUpdate = [bool]$CloseRunningApp
+        if (-not $NoPause -and -not $closeForUpdate -and $decision -eq 'Update') {
+            $report.phase = 'AppCloseChoice'
+            $choice = Read-AppCloseChoice
+            if ($choice -eq 'Postpone') {
+                $report.outcome = 'Postponed'
+                Write-Step 'Update postponed. Run Start.cmd when ready.' 'Обновление отложено. Запустите Start.cmd, когда будете готовы.' Yellow
+                return 2
+            }
+            $closeForUpdate = $choice -eq 'Close'
+        }
+        $report.closeRunningApp = $closeForUpdate
+        if ($closeForUpdate) {
+            Write-Step 'Installing the verified package. Windows will close ChatGPT / Codex processes as authorized.' 'Устанавливаю проверенный пакет. Windows закроет процессы ChatGPT / Codex с вашего разрешения.' Yellow
+        } else {
             if (-not $NoPause) { $report.phase = 'WaitingForAppExit'; Wait-AppExit }
             Write-Step 'Installing the verified package. Running applications will not be force-closed.' 'Устанавливаю проверенный пакет. Запущенные приложения не закрываются принудительно.'
-            $report.phase = 'Deployment'
-            $report.outcome = Install-VerifiedPackage $packagePath $release $snapshot.windowsVersion
-            $report.phase = 'RegistrationCheck'
-            if ($report.outcome -ne 'PendingRegistration' -or $NoPause -or $attempt -ge 3) { break }
-            Write-Step 'ChatGPT was opened again before Windows finished the update.' 'ChatGPT снова открыли до завершения обновления.' Yellow
         }
+        $report.phase = 'Deployment'
+        $report.outcome = Install-VerifiedPackage $packagePath $release $snapshot.windowsVersion -CloseRunningApp:$closeForUpdate
+        $report.phase = 'RegistrationCheck'
         if ($report.outcome -eq 'PendingRegistration') {
-            Write-Step 'Windows prepared the update, but ChatGPT was still open. Close ChatGPT completely and run Start.cmd again. Reopening ChatGPT alone cannot finish this update: its Windows service needs administrator rights.' 'Windows подготовила обновление, но ChatGPT ещё был открыт. Полностью закройте ChatGPT и снова запустите Start.cmd. Простой перезапуск ChatGPT не завершит обновление: для его службы Windows нужны права администратора.' Yellow
+            $registered = Get-InstalledPackage
+            $registeredVersion = if ($registered) { [string]$registered.Version } else { Get-Text 'not registered' 'не зарегистрировано' }
+            $report.findings += New-Finding 'REGISTRATION_PENDING' 'warning' (Get-Text ('Update NOT completed. Registered: ' + $registeredVersion + '; target: ' + $release.Version + '.') ('Обновление НЕ завершено. Зарегистрировано: ' + $registeredVersion + '; требуется: ' + $release.Version + '.')) (Get-Text 'Save work and run Start.cmd, then choose 1 to let Windows close the app and finish the update. If you already chose 1, restart Windows and retry before opening ChatGPT. Check deployment events if it persists. An unchanged version alone does not prove that you reopened the app.' 'Сохраните работу, запустите Start.cmd и выберите 1, чтобы Windows закрыла приложение и завершила обновление. Если уже выбрали 1, перезагрузите Windows и повторите до открытия ChatGPT. При повторном сбое проверьте журнал установки. Старая версия сама по себе не доказывает, что вы снова открыли приложение.')
             return 10
         }
         Write-Step 'The new installed version has been verified. Open ChatGPT normally.' 'Новая установленная версия проверена. Откройте ChatGPT обычным способом.' Green
